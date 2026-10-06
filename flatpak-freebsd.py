@@ -1294,6 +1294,19 @@ def cmd_gui(a):
     remote_url = resolve_remote(DEFAULT_REMOTE)
 
     root = tk.Tk()
+        # иконка окна
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])),
+                             "flatpak-freebsd.png")  # или .ico / .gif
+    if os.path.isfile(icon_path):
+        try:
+            img = tk.PhotoImage(file=icon_path)
+            root.iconphoto(True, img)
+            root._icon = img          # чтобы GC не удалил картинку
+        except tk.TclError:
+            pass
+    # для .ico на Windows иногда удобнее:
+    # if icon_path.endswith(".ico"):
+    #     root.iconbitmap(icon_path)
     root.title("Flatpak FreeBSD")
     root.geometry("920x620")
     root.minsize(700, 480)
