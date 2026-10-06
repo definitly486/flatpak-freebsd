@@ -9,6 +9,7 @@ flatpak-freebsd: скачивание и запуск Flatpak-приложени
   start ЦЕЛЬ       установить, если не стоит, и запустить
   run ID           запустить установленное (после -- идут аргументы приложения)
   update [ID]      обновить одно или все приложения (качаются только изменения)
+  search [СЛОВА]   поиск в каталоге репозитория (-i: подробности, -u: обновить каталог)
   list             что установлено
   info ID          подробности об установленном
   remove ID        удалить (--prune: заодно неиспользуемые рантаймы)
@@ -26,12 +27,16 @@ URL .flatpakrepo или URL самого репозитория.
       --remote https://flatpak.orionbrowser.com/orion-beta.flatpakrepo
   flatpak-freebsd.py run org.gnome.Calculator
   flatpak-freebsd.py update
+  flatpak-freebsd.py search текстовый редактор
+  flatpak-freebsd.py search -i org.gnome.Calculator
 
 Данные: ~/.local/share/flatpak-freebsd (или --root / $FLATPAK_FB_ROOT).
 Настройки окружения: файл ROOT/env (для всех) и ROOT/apps/ID/env (для одного),
 строки KEY=VALUE. Переменные вашей оболочки имеют приоритет над файлами.
 """
 import argparse
+import hashlib
+import io
 import json
 import os
 import re
@@ -40,10 +45,12 @@ import shutil
 import stat
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from configparser import ConfigParser
@@ -54,6 +61,9 @@ KNOWN_REMOTES = {
 }
 DEFAULT_REMOTE = "flathub"
 BRANCH_GUESS = ["stable", "beta", "master", "main"]
+APPSTREAM_REFS = ["appstream", "appstream2"]          # каталог приложений для search
+APPSTREAM_FILES = ["appstream.xml.gz", "appstream.xml"]
+XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
 
 ARCH_INFO = {
     "x86_64": ("x86_64-linux-gnu", ["lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
@@ -147,12 +157,31 @@ class Repo:
         self.tree_cache = {}
         self.bytes = self.done = self.total = 0
 
-    def get(self, path, tries=6):
+    def _read(self, req, label):
+        if label is None:
+            return urllib.request.urlopen(req, timeout=30).read()
+        buf, tty = bytearray(), sys.stderr.isatty()
+        with urllib.request.urlopen(req, timeout=30) as r:
+            total = int(r.headers.get("Content-Length") or 0)
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if tty:
+                    print("\r[%s] %.1f/%.1f MiB   " % (label, len(buf) / 1048576,
+                                                       total / 1048576),
+                          end="", file=sys.stderr, flush=True)
+        if tty:
+            print(file=sys.stderr)
+        return bytes(buf)
+
+    def get(self, path, tries=6, label=None):
         for i in range(tries):
             try:
                 req = urllib.request.Request(self.base + path,
                                              headers={"User-Agent": "ostree"})
-                data = urllib.request.urlopen(req, timeout=30).read()
+                data = self._read(req, label)
                 with self.lock:
                     self.bytes += len(data)
                 return data
@@ -165,9 +194,9 @@ class Repo:
                     raise
                 time.sleep(1 + i)
 
-    def obj(self, csum, ext):
+    def obj(self, csum, ext, label=None):
         h = csum.hex()
-        return self.get("objects/%s/%s.%s" % (h[:2], h[2:], ext))
+        return self.get("objects/%s/%s.%s" % (h[:2], h[2:], ext), label=label)
 
     def head_opt(self, ref):
         """Хеш коммита или None, если такого ref нет в репозитории."""
@@ -667,6 +696,348 @@ def do_run(info, extra, isolate=False):
     os.execve(argv[0], argv, env)
 
 
+# ------------------------------------------------------------------ поиск
+# Каталог приложений лежит в ветке appstream/ARCH того же OSTree-репозитория:
+# ref -> commit -> dirtree -> файл appstream.xml.gz (один объект .filez).
+# Кэш обновляется по хешу коммита: проверка стоит один запрос в 65 байт.
+def warn(msg):
+    print("предупреждение: " + msg, file=sys.stderr)
+
+
+def read_filez(d):
+    """Содержимое объекта .filez (заголовок GVariant + сырой deflate)."""
+    vs = int.from_bytes(d[:4], "big")
+    hdr = d[8:8 + vs]
+    size = int.from_bytes(hdr[0:8], "big")
+    if size == 0:
+        return b""
+    for start in ((8 + vs + 7) & ~7, 8 + vs):
+        try:
+            cand = zlib.decompressobj(-15).decompress(d[start:])
+            if len(cand) == size:
+                return cand
+        except zlib.error:
+            pass
+    raise ValueError("не удалось распаковать объект (size=%d)" % size)
+
+
+def load_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_atomic(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def detect_langs(opt):
+    """ru_RU.UTF-8 -> ['ru_RU', 'ru']; C/POSIX -> []."""
+    s = opt
+    if s is None:
+        s = next((os.environ[k] for k in ("LC_ALL", "LC_MESSAGES", "LANG")
+                  if os.environ.get(k)), "")
+    s = s.split(".")[0].split("@")[0]
+    if not s or s in ("C", "POSIX"):
+        return []
+    langs = [s]
+    if "_" in s:
+        langs.append(s.split("_")[0])
+    return langs
+
+
+def find_appstream_ref(repo, arch):
+    for base in APPSTREAM_REFS:
+        ref = "%s/%s" % (base, arch)
+        c = repo.head_opt(ref)
+        if c is not None:
+            return ref, c
+    return None, None
+
+
+def fetch_appstream(repo, commit, label):
+    """Один файл из корня коммита, остальное дерево не трогаем."""
+    tree, _ = parse_commit(repo.obj(commit, "commit"))
+    files, _dirs = parse_dirtree(repo.obj(tree, "dirtree"))
+    byname = dict(files)
+    for name in APPSTREAM_FILES:
+        if name in byname:
+            return read_filez(repo.obj(byname[name], "filez", label=label))
+    die("в коммите каталога нет файла %s" % " / ".join(APPSTREAM_FILES))
+
+
+def texts_by_lang(parent, path):
+    out = {}
+    for e in parent.iterfind(path):
+        t = "".join(e.itertext()).strip()
+        if t:
+            out.setdefault(e.get(XML_LANG), []).append(t)
+    return out
+
+
+def pick(d, langs):
+    """Значение для первого найденного языка, иначе значение по умолчанию."""
+    for lg in langs:
+        if lg in d:
+            return d[lg]
+    if None in d:
+        return d[None]
+    return next(iter(d.values()), [])
+
+
+def describe(comp, langs):
+    by = {}
+    for desc in comp.iterfind("description"):
+        base = desc.get(XML_LANG)
+        for ch in desc:
+            lg = ch.get(XML_LANG) or base
+            if ch.tag == "p":
+                t = " ".join("".join(ch.itertext()).split())
+                if t:
+                    by.setdefault(lg, []).append(t)
+            elif ch.tag in ("ul", "ol"):
+                for li in ch.iterfind("li"):
+                    t = " ".join("".join(li.itertext()).split())
+                    if t:
+                        by.setdefault(li.get(XML_LANG) or lg, []).append("• " + t)
+    return "\n".join(pick(by, langs))[:1500]
+
+
+def parse_appstream(raw, langs):
+    if raw[:2] == b"\x1f\x8b":
+        raw = zlib.decompress(raw, 16 + zlib.MAX_WBITS)
+    items, root = {}, None
+    for ev, el in ET.iterparse(io.BytesIO(raw), events=("start", "end")):
+        if ev == "start":
+            if root is None:
+                root = el
+            continue
+        if el.tag != "component":
+            continue
+        bundle = next(((b.text or "").strip() for b in el.iterfind("bundle")
+                       if b.get("type") == "flatpak"), "")
+        parts = bundle.split("/")
+        if len(parts) == 4 and parts[0] == "app":
+            name = texts_by_lang(el, "name")
+            summ = texts_by_lang(el, "summary")
+            kws = texts_by_lang(el, "keywords/keyword")
+            kw = list(kws.get(None, []))
+            for lg in langs:
+                if lg in kws:
+                    kw += kws[lg]
+                    break
+            dev = (texts_by_lang(el, "developer_name") or
+                   texts_by_lang(el, "developer/name"))
+            ver = next((r.get("version") for r in el.iterfind("releases/release")
+                        if r.get("version")), "")
+            lic = next(iter(texts_by_lang(el, "project_license").get(None, [])), "")
+            home = next((("".join(u.itertext())).strip() for u in el.iterfind("url")
+                         if u.get("type") == "homepage"), "")
+            n0 = (name.get(None) or next(iter(name.values()), [""]))[0]
+            s0 = (summ.get(None) or next(iter(summ.values()), [""]))[0]
+            items[(parts[1], parts[3])] = {
+                "id": parts[1], "branch": parts[3], "arch": parts[2],
+                "name": (pick(name, langs) or [n0])[0], "name0": n0,
+                "summary": (pick(summ, langs) or [s0])[0], "summary0": s0,
+                "keywords": kw,
+                "categories": [c.text.strip() for c in el.iterfind("categories/category")
+                               if c.text],
+                "developer": (pick(dev, langs) or [""])[0],
+                "license": lic, "homepage": home, "version": ver or "",
+                "description": describe(el, langs),
+            }
+        el.clear()
+        if root is not None:
+            root.clear()
+    return sorted(items.values(), key=lambda x: (x["name"].casefold(), x["id"]))
+
+
+def load_index(url, label, arch, langs, cached=False, refresh=False):
+    """Список приложений репозитория; каталог перекачивается при смене коммита."""
+    repo = Repo(url)
+    key = hashlib.sha1(url.encode()).hexdigest()[:12]
+    cdir = P("appstream", key, arch)
+    os.makedirs(cdir, exist_ok=True)
+    meta_p, raw_p = os.path.join(cdir, "meta.json"), os.path.join(cdir, "appstream.raw")
+    idx_p = os.path.join(cdir, "index-%s.json" % ("_".join(langs) or "C"))
+    meta = load_json(meta_p)
+    have = bool(meta) and os.path.exists(raw_p)
+
+    if not (cached and have):
+        try:
+            ref, commit = find_appstream_ref(repo, arch)
+        except Exception as e:
+            if not have:
+                die("репозиторий %s недоступен: %s" % (url, e))
+            warn("репозиторий недоступен (%s), использую сохранённый каталог" % e)
+            ref = commit = None
+        else:
+            if ref is None:
+                die("в %s нет ветки appstream/%s: у репозитория нет каталога приложений"
+                    % (url, arch))
+            ch = commit.hex()
+            if refresh or not have or meta.get("commit") != ch:
+                print("[%s] скачиваю каталог приложений (%s, %s)"
+                      % (label, ref, ch[:12]), file=sys.stderr)
+                data = fetch_appstream(repo, commit, label)
+                write_atomic(raw_p, data)
+                meta = {"url": url, "ref": ref, "commit": ch, "time": int(time.time())}
+                write_atomic(meta_p, json.dumps(meta).encode())
+                for f in os.listdir(cdir):
+                    if f.startswith("index-"):
+                        os.remove(os.path.join(cdir, f))
+
+    idx = load_json(idx_p)
+    if idx and idx.get("commit") == meta.get("commit"):
+        return idx["items"]
+    with open(raw_p, "rb") as f:
+        raw = f.read()
+    print("[%s] разбираю каталог..." % label, file=sys.stderr)
+    try:
+        items = parse_appstream(raw, langs)
+    except (ET.ParseError, zlib.error) as e:
+        os.remove(raw_p)
+        die("каталог повреждён (%s), повторите команду" % e)
+    write_atomic(idx_p, json.dumps({"commit": meta.get("commit"), "items": items},
+                                   ensure_ascii=False).encode("utf-8"))
+    return items
+
+
+def score(it, words):
+    """0 — не подходит; иначе сумма очков по каждому слову (слова связаны по И)."""
+    idl = it["id"].lower()
+    last = idl.rsplit(".", 1)[-1]
+    names = [it["name"].casefold(), it["name0"].casefold()]
+    summ = [it["summary"].casefold(), it["summary0"].casefold()]
+    kws = [k.casefold() for k in it["keywords"]]
+    cats = [c.casefold() for c in it["categories"]]
+    total = 0
+    for w in words:
+        if idl == w:
+            s = 100
+        elif last == w:
+            s = 90
+        elif w in names:
+            s = 80
+        elif any(n.startswith(w) for n in names):
+            s = 60
+        elif any(w in n for n in names):
+            s = 40
+        elif any(w in k for k in kws):
+            s = 25
+        elif w in idl:
+            s = 20
+        elif any(w in x for x in summ):
+            s = 15
+        elif any(w in c for c in cats):
+            s = 5
+        else:
+            return 0
+        total += s
+    return total
+
+
+def clip(s, n):
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[:max(n - 1, 0)] + "…"
+
+
+def show_list(rows, multi):
+    width = shutil.get_terminal_size((110, 20)).columns
+    nw = min(max(len(r["name"]) for r in rows), 28)
+    iw = min(max(len(r["id"]) for r in rows), 46)
+    bw = 8
+    rw = max(len(r["remote"]) for r in rows) if multi else 0
+    fixed = 2 + nw + 1 + iw + 1 + bw + 1 + (rw + 1 if multi else 0)
+    sw = max(width - fixed, 10)
+    head = "  %-*s %-*s %-*s " % (nw, "Название", iw, "ID", bw, "Ветка")
+    if multi:
+        head += "%-*s " % (rw, "Репозиторий")
+    print(head + "Описание")
+    for r in rows:
+        line = "%s %-*s %-*s %-*s " % ("*" if r["installed"] else " ",
+                                       nw, clip(r["name"], nw), iw, clip(r["id"], iw),
+                                       bw, clip(r["branch"], bw))
+        if multi:
+            line += "%-*s " % (rw, r["remote"])
+        print(line + clip(r["summary"], sw))
+
+
+def show_info(r):
+    rows = [("Название", r["name"]), ("ID", r["id"]), ("Ветка", r["branch"]),
+            ("Архитектура", r["arch"]), ("Версия", r["version"]),
+            ("Разработчик", r["developer"]), ("Лицензия", r["license"]),
+            ("Сайт", r["homepage"]), ("Категории", ", ".join(r["categories"])),
+            ("Ключевые слова", ", ".join(r["keywords"])),
+            ("Репозиторий", r["remote"]),
+            ("Установлено", "да" if r["installed"] else "нет")]
+    for k, v in rows:
+        if v:
+            print("%-15s %s" % (k + ":", v))
+    if r["summary"]:
+        print("\n" + r["summary"])
+    if r["description"]:
+        print()
+        w = min(shutil.get_terminal_size((100, 20)).columns, 100)
+        for para in r["description"].split("\n"):
+            print(textwrap.fill(para, width=w,
+                                subsequent_indent="  " if para.startswith("•") else ""))
+
+
+def cmd_search(a):
+    arch = a.arch or host_arch()
+    langs = detect_langs(a.lang)
+    specs = a.remote or [DEFAULT_REMOTE]
+    multi = len(specs) > 1
+    words = [w.casefold() for w in a.query]
+    rows = []
+    for spec in specs:
+        url = resolve_remote(spec)
+        label = spec if len(spec) < 30 else url
+        for it in load_index(url, label, arch, langs, a.cached, a.refresh):
+            s = score(it, words) if words else 1
+            if s:
+                r = dict(it)
+                r.update(score=s, remote=label, installed=os.path.isfile(
+                    P("apps", it["id"], it["branch"], "info.json")))
+                rows.append(r)
+    rows.sort(key=lambda r: (-r["score"], r["name"].casefold(), r["id"]))
+
+    if a.info:
+        if not words:
+            die("укажите ID или название приложения")
+        exact = [r for r in rows if r["id"].casefold() == " ".join(words)]
+        pool = exact or (rows if len(rows) == 1 else [])
+        if not pool:
+            if not rows:
+                die("ничего не найдено")
+            show_list(rows[:a.limit or None], multi)
+            die("\nнесколько совпадений: укажите точный ID")
+        if a.json:
+            print(json.dumps(pool[0], ensure_ascii=False, indent=1))
+        else:
+            show_info(pool[0])
+        return
+
+    total = len(rows)
+    shown = rows[:a.limit] if a.limit > 0 else rows
+    if a.json:
+        print(json.dumps(shown, ensure_ascii=False, indent=1))
+        return
+    if not shown:
+        print("ничего не найдено", file=sys.stderr)
+        sys.exit(1)
+    show_list(shown, multi)
+    print("\nнайдено: %d, показано: %d.  * — установлено.  Установка: %s install ID%s" % (
+        total, len(shown), os.path.basename(sys.argv[0]),
+        "" if specs[0] == DEFAULT_REMOTE else " --remote " + specs[0]), file=sys.stderr)
+
+
 # ------------------------------------------------------------ команды
 def make_target(a):
     arch = getattr(a, "arch", None) or host_arch()
@@ -797,6 +1168,19 @@ def main():
     p.add_argument("--force", action="store_true")
     sub.add_parser("list")
     sub.add_parser("check")
+    p = sub.add_parser("search", help="поиск в каталоге репозитория")
+    p.add_argument("query", nargs="*", help="слова для поиска (без них — весь каталог)")
+    p.add_argument("-r", "--remote", action="append",
+                   help="flathub (по умолчанию), flathub-beta, URL .flatpakrepo или "
+                        "репозитория; можно несколько раз")
+    p.add_argument("--arch")
+    p.add_argument("--lang", help="язык названий: ru, ru_RU (по умолчанию из LANG)")
+    p.add_argument("-n", "--limit", type=int, default=25, help="сколько показать (0 — все)")
+    p.add_argument("-i", "--info", action="store_true", help="подробности о приложении")
+    p.add_argument("-u", "--refresh", action="store_true", help="перекачать каталог")
+    p.add_argument("--cached", action="store_true",
+                   help="не проверять репозиторий, если каталог уже сохранён")
+    p.add_argument("--json", action="store_true", help="вывод в JSON")
     for name in ("info", "link", "wrap"):
         p = sub.add_parser(name)
         p.add_argument("target")
@@ -829,6 +1213,8 @@ def main():
         do_run(load_info(a.target, a.branch), extra, a.isolate)
     elif a.cmd == "update":
         cmd_update(a)
+    elif a.cmd == "search":
+        cmd_search(a)
     elif a.cmd == "list":
         cmd_list()
     elif a.cmd == "info":
