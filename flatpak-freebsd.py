@@ -13,7 +13,7 @@ flatpak-freebsd: скачивание и запуск Flatpak-приложени
   list             что установлено
   info ID          подробности об установленном
   remove ID        удалить (--prune: заодно неиспользуемые рантаймы)
-  link ID          ссылка /app -> файлы приложения (нужен root, один раз)
+  link ID          настроить /app (root-ссылка один раз, приложения переключаются без root)
   wrap ID          пересоздать обёртки для вспомогательных процессов
   check            диагностика окружения
   gui              графический интерфейс (tkinter)
@@ -666,17 +666,92 @@ def wrap(info, quiet=False):
 
 
 # ------------------------------------------------------------ ссылка /app
+# /compat/linux/app нельзя каждый раз менять на новый Flatpak: это требует root.
+# Поэтому один раз делаем root-ссылку на пользовательский переключатель:
+#
+#   /compat/linux/app -> ROOT/.app-current -> ROOT/apps/ID/branch/files
+#
+# При запуске другого приложения меняется только ROOT/.app-current, без sudo.
+APP_CURRENT_NAME = ".app-current"
+
+
 def link_path():
     return "/compat/linux/app" if os.path.isdir("/compat/linux") else "/app"
 
 
-def link_ok(afiles):
+def app_current_path():
+    return P(APP_CURRENT_NAME)
+
+
+def root_app_link_ok():
+    """Проверить, что root-ссылка /app ведёт на наш пользовательский переключатель."""
     link = link_path()
-    return os.path.islink(link) and os.path.realpath(link) == os.path.realpath(afiles)
+    current = os.path.abspath(app_current_path())
+
+    if not os.path.islink(link):
+        return False
+
+    try:
+        target = os.readlink(link)
+        if not os.path.isabs(target):
+            target = os.path.join(os.path.dirname(link), target)
+        return os.path.abspath(target) == current
+    except OSError:
+        return False
+
+
+def link_ok(afiles):
+    """Проверить одновременно root-ссылку и текущий выбранный Flatpak."""
+    if not root_app_link_ok():
+        return False
+
+    current = app_current_path()
+    try:
+        return os.path.islink(current) and os.path.realpath(current) == os.path.realpath(afiles)
+    except OSError:
+        return False
 
 
 def ensure_link(afiles, quiet=False):
     link = link_path()
+    current = app_current_path()
+
+    # /app в Linuxulator создаётся root один раз. После этого переключение
+    # между приложениями выполняется обычным пользователем.
+    if os.path.isdir("/compat/linux"):
+        if not root_app_link_ok():
+            if not quiet:
+                print("\nНужно один раз создать постоянную ссылку /app -> переключатель:")
+                print("  sudo ln -sfn %s %s\n" %
+                      (shlex.quote(current), shlex.quote(link)))
+            return False
+
+        try:
+            os.makedirs(os.path.dirname(current), exist_ok=True)
+
+            # Атомарно меняем пользовательскую ссылку, чтобы не оставлять
+            # /app в полусломанном состоянии.
+            tmp = current + ".tmp-%d" % os.getpid()
+            try:
+                if os.path.lexists(tmp):
+                    os.unlink(tmp)
+                os.symlink(afiles, tmp)
+                os.replace(tmp, current)
+            finally:
+                if os.path.lexists(tmp):
+                    os.unlink(tmp)
+
+            if not quiet:
+                print("переключён /app -> %s" % afiles)
+            return True
+        except OSError as e:
+            if not quiet:
+                print("не удалось переключить %s -> %s: %s" %
+                      (current, afiles, e), file=sys.stderr)
+            return False
+
+    # Старый/не-Linuxulator вариант: /app находится непосредственно в host FS.
+    # Здесь root-ссылка всё ещё нужна, но только один раз для конкретной системы.
     if link_ok(afiles):
         return True
     try:
@@ -688,7 +763,7 @@ def ensure_link(afiles, quiet=False):
     except OSError:
         if not quiet:
             print("\nМногие приложения зовут свои программы по пути /app. Выполните от root:")
-            print("  sudo ln -sfn %s %s\n" % (shlex.quote(afiles), link))
+            print("  sudo ln -sfn %s %s\n" % (shlex.quote(afiles), shlex.quote(link)))
         return False
 
 
