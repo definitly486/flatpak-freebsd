@@ -556,6 +556,46 @@ exec {ld} \\
 """
 
 
+WRAP_MARK = ".wrap-v3"
+
+
+def local_ld(ld, d):
+    """Копия загрузчика рантайма в каталоге d.
+
+    Программы вроде firefox.real ищут соседние файлы через /proc/self/exe. При запуске
+    «ld-linux программа» это путь самого загрузчика, поэтому кладём его копию (не ссылку)
+    рядом с программой: тогда /proc/self/exe указывает в её каталог."""
+    dst = os.path.join(d, ".ld.so")
+    try:
+        if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(ld):
+            tmp = dst + ".tmp"
+            shutil.copyfile(ld, tmp)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, dst)
+        return dst
+    except OSError:
+        return ld
+
+
+def launcher_target(p, real):
+    """Если p — крошечный запускатор вида «exec(/proc/self/exe + '-bin')» (firefox),
+    вернуть путь к настоящей программе p-bin.real, иначе real.
+
+    Запускатор берёт путь из /proc/self/exe, а при запуске через загрузчик это путь
+    загрузчика, поэтому его проще обойти и сразу запустить p-bin."""
+    try:
+        if os.path.getsize(real) > 65536:
+            return real
+        with open(real, "rb") as f:
+            data = f.read()
+    except OSError:
+        return real
+    if b"/proc/self/exe" in data and b"-bin" in data and \
+            (os.path.exists(p + "-bin.real") or os.path.exists(p + "-bin")):
+        return p + "-bin.real"
+    return real
+
+
 def wrap(info, quiet=False):
     """Вспомогательные программы приложения (их оно зовёт по /app/...) запускаем
     через загрузчик рантайма: системный glibc Linuxulator для них слишком старый."""
@@ -583,11 +623,15 @@ def wrap(info, quiet=False):
                 os.rename(p, real)
             tmp = p + ".tmp"
             with open(tmp, "w") as f:
-                f.write(WRAP_TMPL.format(ld=shlex.quote(ld), libs=shlex.quote(libs),
-                                         real=shlex.quote(real)))
+                f.write(WRAP_TMPL.format(ld=shlex.quote(local_ld(ld, d)), libs=shlex.quote(libs),
+                                         real=shlex.quote(launcher_target(p, real))))
             os.chmod(tmp, 0o755)
             os.replace(tmp, p)
             count += 1
+    try:
+        open(os.path.join(afiles, WRAP_MARK), "w").close()
+    except OSError:
+        pass
     if not quiet:
         print("обёртки: %d" % count)
     return count
@@ -657,6 +701,34 @@ def gio_tls_dir(rdir, rfiles, arch):
     return d
 
 
+def shebang(path):
+    """Вернуть (интерпретатор, аргумент) из #!-строки или None."""
+    try:
+        with open(path, "rb") as f:
+            first = f.readline(256)
+    except OSError:
+        return None
+    if not first.startswith(b"#!"):
+        return None
+    parts = first[2:].decode("utf-8", "replace").split(None, 1)
+    if not parts:
+        return None
+    return parts[0], (parts[1].strip() if len(parts) > 1 else None)
+
+
+def resolve_interp(interp, afiles, rfiles):
+    """Найти интерпретатор скрипта: в рантайме, в приложении, в /compat/linux."""
+    base = os.path.basename(interp)
+    cands = [os.path.join(rfiles, "bin", base),
+             os.path.join(afiles, "bin", base),
+             "/compat/linux" + interp,
+             interp]
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    return None
+
+
 def do_run(info, extra, isolate=False):
     afiles, rfiles, rdir = paths_for(info)
     arch = info["arch"]
@@ -664,6 +736,8 @@ def do_run(info, extra, isolate=False):
     cmd = command_path(info, afiles)
     if ld is None or not os.path.exists(cmd):
         die("приложение не готово. Выполните: install %s" % info["id"])
+    if not os.path.exists(os.path.join(afiles, WRAP_MARK)):
+        wrap(info, quiet=True)                         # обновить обёртки до новой схемы
     if linux_loaded() is False:
         print("предупреждение: Linuxulator не загружен (service linux start)", file=sys.stderr)
     if not link_ok(afiles) and not ensure_link(afiles):
@@ -692,10 +766,30 @@ def do_run(info, extra, isolate=False):
             env[k] = os.path.join(var, sub)
     if not env.get("DISPLAY"):
         print("предупреждение: DISPLAY не задан", file=sys.stderr)
+    lp = lib_path(afiles, rfiles, arch)
     if elf_interp(cmd):
-        argv = [ld, "--library-path", lib_path(afiles, rfiles, arch), cmd] + extra
+        argv = [local_ld(ld, os.path.dirname(os.path.realpath(cmd))),
+                "--library-path", lp, cmd] + extra
     else:
-        argv = [cmd] + extra
+        sb = shebang(cmd)
+        if sb:
+            interp, arg = sb
+            via_env = interp.endswith("/env") and arg
+            if via_env:                                  # #!/usr/bin/env python3
+                real = resolve_interp("/usr/bin/" + arg.split()[0], afiles, rfiles)
+            else:
+                real = resolve_interp(interp, afiles, rfiles)
+            if real is None:
+                die("не найден интерпретатор скрипта %s: %s" % (cmd, interp))
+            if elf_interp(real):
+                argv = [ld, "--library-path", lp, real]
+            else:
+                argv = [real]                            # например, родной /bin/sh
+            if arg and not via_env:
+                argv.append(arg)
+            argv += [cmd] + extra
+        else:
+            argv = [cmd] + extra
     os.execve(argv[0], argv, env)
 
 
