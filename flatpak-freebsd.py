@@ -555,7 +555,40 @@ def command_path(info, afiles):
     return os.path.join(afiles, "bin", c)
 
 
-WRAP_MARK = ".wrap-v6"
+def webkit_dirs(afiles, rfiles, arch):
+    """Где лежат вспомогательные процессы WebKitGTK и injected-bundle.
+
+    Пути вида /usr/libexec/webkit2gtk-4.1 зашиты в libwebkit2gtk, а в Linuxulator
+    /usr указывает в /compat/linux, где этих файлов нет. WebKit умеет брать каталог
+    из WEBKIT_EXEC_PATH и WEBKIT_INJECTED_BUNDLE_PATH.
+    Возвращает ({версия: каталог с WebKitNetworkProcess}, {версия: каталог injected-bundle})."""
+    import glob
+    tri = ARCH_INFO.get(arch, ARCH_INFO["x86_64"])[0]
+    execs, bundles = {}, {}
+    for base in (afiles, rfiles):
+        for pat in ("libexec/webkit*gtk-*", "lib/%s/webkit*gtk-*" % tri,
+                    "lib/webkit*gtk-*", "lib64/webkit*gtk-*"):
+            for d in sorted(glob.glob(os.path.join(base, pat))):
+                ver = os.path.basename(d).split("-", 1)[1]
+                if os.path.isfile(os.path.join(d, "WebKitNetworkProcess")):
+                    execs.setdefault(ver, d)
+                ib = os.path.join(d, "injected-bundle")
+                if os.path.isdir(ib):
+                    bundles.setdefault(ver, ib)
+    return execs, bundles
+
+
+def pick_webkit(found):
+    """Если версий несколько, берём 4.1 (его используют GTK3-приложения сейчас),
+    затем 6.0, затем остальные. Можно переопределить в ROOT/apps/ID/env."""
+    for v in ("4.1", "6.0", "4.0"):
+        if v in found:
+            return found[v]
+    return next(iter(found.values()), None)
+
+
+
+WRAP_MARK = ".wrap-v7"
 INTERP_NAME = ".ld"                  # копия загрузчика рантайма в каталоге приложения
 INTERP_PATH = b"/app/" + INTERP_NAME.encode()   # короткий путь, влезает в PT_INTERP
 
@@ -651,6 +684,14 @@ def wrap(info, quiet=False):
     for p in elfs:
         if elf_interp(p):
             if patch_interp(p):
+                count += 1
+    # помощники WebKit лежат в рантайме; их WebKit запускает сам, напрямую
+    execs, _ = webkit_dirs(afiles, rfiles, info["arch"])
+    for d in set(execs.values()):
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            if (os.path.isfile(p) and not os.path.islink(p) and ".so" not in name
+                    and elf_interp(p) and patch_interp(p)):
                 count += 1
     for p in elfs:                                     # запускатели -> ссылка на X-bin
         if is_launcher_stub(p):
@@ -846,6 +887,55 @@ def typelib_path(afiles, rfiles, arch):
     return out
 
 
+def usr_link_specs(rfiles, arch):
+    """Каталоги WebKit в рантайме: [(путь относительно /usr, реальный каталог)]."""
+    import glob
+    tri = ARCH_INFO.get(arch, ARCH_INFO["x86_64"])[0]
+    out = []
+    for pat in ("libexec/webkit*gtk-*", "lib/%s/webkit*gtk-*" % tri):
+        for d in sorted(glob.glob(os.path.join(rfiles, pat))):
+            if os.path.isdir(d):
+                out.append((os.path.relpath(d, rfiles), d))
+    return out
+
+
+def ensure_usr_links(rfiles, arch, quiet=False):
+    """Путь /usr/libexec/webkit2gtk-4.1 зашит в libwebkit2gtk и от WEBKIT_EXEC_PATH
+    в release-сборках может не зависеть. Поэтому, как и с /app, делаем один раз
+    root-ссылку  /compat/linux/usr/REL -> ROOT/.usr/REL  и переключаем только
+    пользовательскую часть ROOT/.usr/REL -> каталог рантайма текущего приложения."""
+    base = "/compat/linux"
+    if not os.path.isdir(base):
+        return True
+    missing = []
+    for rel, real in usr_link_specs(rfiles, arch):
+        sw = P(".usr", rel)
+        os.makedirs(os.path.dirname(sw), exist_ok=True)
+        tmp = sw + ".tmp-%d" % os.getpid()
+        try:
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+            os.symlink(real, tmp)
+            os.replace(tmp, sw)
+        except OSError as e:
+            warn("не удалось переключить %s: %s" % (sw, e))
+            continue
+        guest = os.path.join(base, "usr", rel)
+        try:
+            ok = os.path.islink(guest) and os.path.abspath(os.readlink(guest)) == os.path.abspath(sw)
+        except OSError:
+            ok = False
+        if not ok:
+            missing.append((guest, sw))
+    if missing and not quiet:
+        print("\nWebKit ищет свои процессы по фиксированному пути. Один раз от root:")
+        for guest, sw in missing:
+            print("  sudo mkdir -p %s && sudo ln -sfn %s %s" % (
+                shlex.quote(os.path.dirname(guest)), shlex.quote(sw), shlex.quote(guest)))
+        print()
+    return not missing
+
+
 def do_run(info, extra, isolate=False):
     afiles, rfiles, rdir = paths_for(info)
     arch = info["arch"]
@@ -861,12 +951,19 @@ def do_run(info, extra, isolate=False):
         die("ссылка %s должна указывать на %s: через неё ядро находит загрузчик рантайма"
             % (link_path(), afiles))
 
+    ensure_usr_links(rfiles, arch)
+
     merged = dict(ENV_DEFAULTS)
     merged.update(read_env_file(P("env")))
     merged.update(read_env_file(P("apps", info["id"], "env")))
     gd = gio_tls_dir(rdir, rfiles, arch)
     if gd:
         merged.setdefault("GIO_MODULE_DIR", gd)
+    wx, wb = webkit_dirs(afiles, rfiles, arch)
+    if pick_webkit(wx):
+        merged.setdefault("WEBKIT_EXEC_PATH", pick_webkit(wx))
+    if pick_webkit(wb):
+        merged.setdefault("WEBKIT_INJECTED_BUNDLE_PATH", pick_webkit(wb))
     merged["FLATPAK_ID"] = info["id"]
     env = dict(os.environ)
     for k, v in merged.items():
@@ -1749,7 +1846,9 @@ def main():
     elif a.cmd == "remove":
         cmd_remove(a)
     elif a.cmd == "link":
-        ensure_link(paths_for(load_info(a.target, a.branch))[0])
+        li = load_info(a.target, a.branch)
+        ensure_link(paths_for(li)[0])
+        ensure_usr_links(paths_for(li)[1], li["arch"])
     elif a.cmd == "wrap":
         wrap(load_info(a.target, a.branch))
     elif a.cmd == "check":
