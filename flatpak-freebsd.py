@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+flatpak-freebsd: скачивание и запуск Flatpak-приложений на FreeBSD через Linuxulator.
+Без ostree и flatpak: репозиторий читается напрямую по HTTP.
+
+Команды:
+  install ЦЕЛЬ     скачать приложение и его рантайм, сделать обёртки
+  start ЦЕЛЬ       установить, если не стоит, и запустить
+  run ID           запустить установленное (после -- идут аргументы приложения)
+  update [ID]      обновить одно или все приложения (качаются только изменения)
+  list             что установлено
+  info ID          подробности об установленном
+  remove ID        удалить (--prune: заодно неиспользуемые рантаймы)
+  link ID          ссылка /app -> файлы приложения (нужен root, один раз)
+  wrap ID          пересоздать обёртки для вспомогательных процессов
+  check            диагностика окружения
+
+ЦЕЛЬ: ID приложения (org.mozilla.firefox), либо путь/URL к .flatpakref.
+Репозиторий задаётся --remote: flathub (по умолчанию), flathub-beta,
+URL .flatpakrepo или URL самого репозитория.
+
+Примеры:
+  flatpak-freebsd.py install org.gnome.Calculator
+  flatpak-freebsd.py start com.kagi.Orion --branch beta \\
+      --remote https://flatpak.orionbrowser.com/orion-beta.flatpakrepo
+  flatpak-freebsd.py run org.gnome.Calculator
+  flatpak-freebsd.py update
+
+Данные: ~/.local/share/flatpak-freebsd (или --root / $FLATPAK_FB_ROOT).
+Настройки окружения: файл ROOT/env (для всех) и ROOT/apps/ID/env (для одного),
+строки KEY=VALUE. Переменные вашей оболочки имеют приоритет над файлами.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import zlib
+from concurrent.futures import ThreadPoolExecutor
+from configparser import ConfigParser
+
+KNOWN_REMOTES = {
+    "flathub": "https://dl.flathub.org/repo/",
+    "flathub-beta": "https://dl.flathub.org/beta-repo/",
+}
+DEFAULT_REMOTE = "flathub"
+BRANCH_GUESS = ["stable", "beta", "master", "main"]
+
+ARCH_INFO = {
+    "x86_64": ("x86_64-linux-gnu", ["lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                                    "lib64/ld-linux-x86-64.so.2",
+                                    "lib/ld-linux-x86-64.so.2"]),
+    "aarch64": ("aarch64-linux-gnu", ["lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+                                      "lib64/ld-linux-aarch64.so.1",
+                                      "lib/ld-linux-aarch64.so.1"]),
+}
+
+# Значения по умолчанию для окружения приложения (переопределяются файлами env и оболочкой).
+ENV_DEFAULTS = {
+    "GDK_BACKEND": "x11",
+    "QT_QPA_PLATFORM": "xcb",
+    "GSK_RENDERER": "cairo",
+    "LIBGL_ALWAYS_SOFTWARE": "1",
+    "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS": "1",   # bwrap в Linuxulator нет
+    "WEBKIT_DISABLE_COMPOSITING_MODE": "1",
+    "GTK_A11Y": "none",
+    "NO_AT_BRIDGE": "1",
+    "GIO_USE_PROXY_RESOLVER": "dummy",
+}
+
+ROOT = None
+
+
+def P(*a):
+    return os.path.join(ROOT, *a)
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def host_arch():
+    return {"amd64": "x86_64", "x86_64": "x86_64",
+            "arm64": "aarch64", "aarch64": "aarch64"}.get(os.uname().machine, "x86_64")
+
+
+# ------------------------------------------------- минимальный разбор GVariant
+def osz(n):
+    return 1 if n < 256 else 2 if n < 65536 else 4
+
+
+def rd(b, off, sz):
+    return int.from_bytes(b[off:off + sz], "little")
+
+
+def parse_array(a):
+    if not a:
+        return []
+    o = osz(len(a))
+    last = rd(a, len(a) - o, o)
+    n = (len(a) - last) // o
+    out, s = [], 0
+    for i in range(n):
+        e = rd(a, last + i * o, o)
+        out.append(a[s:e])
+        s = e
+    return out
+
+
+def parse_commit(d):
+    o = osz(len(d)) * 6
+    return d[-o - 64:-o - 32], d[-o - 32:-o]          # dirtree, dirmeta
+
+
+def parse_dirtree(d):
+    o = osz(len(d))
+    fend = rd(d, len(d) - o, o)
+    files, dirs = [], []
+    for e in parse_array(d[:fend]):
+        oe = osz(len(e))
+        ne = rd(e, len(e) - oe, oe)
+        files.append((e[:ne - 1].decode(), e[ne:ne + 32]))
+    for e in parse_array(d[fend:len(d) - o]):
+        oe = osz(len(e))
+        ne = rd(e, len(e) - oe, oe)
+        te = rd(e, len(e) - 2 * oe, oe)
+        dirs.append((e[:ne - 1].decode(), e[ne:te]))
+    return files, dirs
+
+
+# --------------------------------------------------------- клиент OSTree/HTTP
+class Repo:
+    def __init__(self, base, workers=16):
+        self.base = base if base.endswith("/") else base + "/"
+        self.workers = workers
+        self.lock = threading.Lock()
+        self.tree_cache = {}
+        self.bytes = self.done = self.total = 0
+
+    def get(self, path, tries=6):
+        for i in range(tries):
+            try:
+                req = urllib.request.Request(self.base + path,
+                                             headers={"User-Agent": "ostree"})
+                data = urllib.request.urlopen(req, timeout=30).read()
+                with self.lock:
+                    self.bytes += len(data)
+                return data
+            except urllib.error.HTTPError as e:
+                if e.code == 404 or i == tries - 1:
+                    raise
+                time.sleep(1 + i)
+            except Exception:
+                if i == tries - 1:
+                    raise
+                time.sleep(1 + i)
+
+    def obj(self, csum, ext):
+        h = csum.hex()
+        return self.get("objects/%s/%s.%s" % (h[:2], h[2:], ext))
+
+    def head_opt(self, ref):
+        """Хеш коммита или None, если такого ref нет в репозитории."""
+        try:
+            return bytes.fromhex(self.get("refs/heads/" + ref).decode().strip())
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise
+
+    def head(self, ref):
+        try:
+            c = self.head_opt(ref)
+        except Exception as e:
+            die("репозиторий %s недоступен: %s" % (self.base, e))
+        if c is None:
+            die("ref %s не найден в %s" % (ref, self.base))
+        return c
+
+    def _load_tree(self, job):
+        tree, dest = job
+        os.makedirs(dest, exist_ok=True)
+        parsed = self.tree_cache.get(tree)
+        if parsed is None:
+            parsed = parse_dirtree(self.obj(tree, "dirtree"))
+            self.tree_cache[tree] = parsed
+        files, dirs = parsed
+        return ([(c, os.path.join(dest, n)) for n, c in files],
+                [(t, os.path.join(dest, n)) for n, t in dirs])
+
+    def _fetch(self, item):
+        csum, paths = item
+        todo = [p for p in paths if not os.path.lexists(p)]
+        if not todo:
+            with self.lock:
+                self.done += len(paths)
+            return
+        d = self.obj(csum, "filez")
+        vs = int.from_bytes(d[:4], "big")
+        hdr = d[8:8 + vs]                      # (tuuuusa(ayay)), big-endian
+        size = int.from_bytes(hdr[0:8], "big")
+        mode = int.from_bytes(hdr[16:20], "big")
+        o = osz(len(hdr))
+        se = rd(hdr, len(hdr) - o, o)
+        if stat.S_ISLNK(mode):
+            target = hdr[24:se - 1].decode()
+            for p in todo:
+                os.symlink(target, p)
+        else:
+            if size == 0:
+                data = b""
+            else:
+                data = None
+                for start in ((8 + vs + 7) & ~7, 8 + vs):
+                    try:
+                        cand = zlib.decompressobj(-15).decompress(d[start:])
+                        if len(cand) == size:
+                            data = cand
+                            break
+                    except zlib.error:
+                        pass
+                if data is None:
+                    raise ValueError("не удалось распаковать (size=%d)" % size)
+            perm = (mode & 0o777) | 0o600
+            first = todo[0]
+            tmp = first + ".part"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, perm)
+            os.rename(tmp, first)
+            for p in todo[1:]:                 # одинаковый объект -> жёсткая ссылка
+                try:
+                    os.link(first, p)
+                except OSError:
+                    with open(p, "wb") as f:
+                        f.write(data)
+                    os.chmod(p, perm)
+        with self.lock:
+            self.done += len(paths)
+
+    def _progress(self, label, stop):
+        t0 = time.time()
+        while not stop.is_set():
+            el = max(time.time() - t0, 0.1)
+            rate = self.done / el
+            eta = (self.total - self.done) / rate if rate > 0 else 0
+            print("\r[%s] файлы: %d/%d | %.0f MiB | %.1f MiB/s | ETA %dm%02ds   " % (
+                label, self.done, self.total, self.bytes / 1048576,
+                self.bytes / 1048576 / el, eta // 60, eta % 60), end="", flush=True)
+            stop.wait(0.5)
+
+    def pull(self, ref, out, label):
+        """Скачать ref в каталог out (готовые файлы пропускаются)."""
+        self.bytes = self.done = self.total = 0
+        commit = self.head(ref)
+        tree, _ = parse_commit(self.obj(commit, "commit"))
+        print("[%s] читаю структуру каталогов..." % label, flush=True)
+        all_files, level, ndirs = [], [(tree, out)], 0
+        with ThreadPoolExecutor(self.workers) as ex:
+            while level:
+                nxt = []
+                for files, dirs in ex.map(self._load_tree, level):
+                    all_files += files
+                    nxt += dirs
+                ndirs += len(level)
+                print("\r  каталогов: %d, файлов: %d   " % (ndirs, len(all_files)),
+                      end="", flush=True)
+                level = nxt
+        print()
+        by = {}
+        for c, p in all_files:
+            by.setdefault(c, []).append(p)
+        self.total = len(all_files)
+        errors = []
+
+        def safe(item):
+            try:
+                self._fetch(item)
+            except Exception as e:
+                errors.append((item[1][0], repr(e)))
+
+        stop = threading.Event()
+        th = threading.Thread(target=self._progress, args=(label, stop), daemon=True)
+        th.start()
+        try:
+            with ThreadPoolExecutor(self.workers) as ex:
+                list(ex.map(safe, by.items()))
+        finally:
+            stop.set()
+            th.join()
+        print()
+        if errors:
+            for p, e in errors[:20]:
+                print("  ошибка:", p, e, file=sys.stderr)
+            die("[%s] ошибок: %d. Повторите команду: готовое пропустится."
+                % (label, len(errors)))
+        return commit.hex()
+
+
+# ---------------------------------------------------------------- вспомогательное
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def fetch_text(src):
+    if os.path.exists(src):
+        with open(src, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    try:
+        req = urllib.request.Request(src, headers={"User-Agent": "flatpak"})
+        return urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+    except Exception as e:
+        die("не удалось получить %s: %s" % (src, e))
+
+
+def parse_ini(text):
+    cp = ConfigParser(interpolation=None, strict=False)
+    cp.optionxform = str
+    try:
+        cp.read_string(text)
+    except Exception:
+        return {}
+    return {s: dict(cp.items(s)) for s in cp.sections()}
+
+
+def resolve_remote(spec):
+    """flathub | flathub-beta | URL .flatpakrepo | URL репозитория -> URL репозитория."""
+    spec = spec or DEFAULT_REMOTE
+    if spec in KNOWN_REMOTES:
+        return KNOWN_REMOTES[spec]
+    if spec.endswith(".flatpakrepo"):
+        url = parse_ini(fetch_text(spec)).get("Flatpak Repo", {}).get("Url")
+        if not url:
+            die("в %s нет строки Url=" % spec)
+        return url if url.endswith("/") else url + "/"
+    return spec if spec.endswith("/") else spec + "/"
+
+
+def split_ref(r):
+    parts = r.split("/")
+    if len(parts) != 3:
+        die("странная запись runtime=%s" % r)
+    return parts
+
+
+# ---------------------------------------------------------------- установка
+def sync(repo, ref, dest, label, force=False):
+    """Скачать ref в dest атомарно (через dest.new). True, если что-то менялось."""
+    commit = repo.head(ref).hex()
+    cur = read_text(os.path.join(dest, ".commit"))
+    if not force and cur == commit:
+        print("[%s] актуально (%s)" % (label, commit[:12]))
+        return False
+    if os.path.isdir(dest) and cur is None and not force:
+        print("[%s] каталог без метки: докачиваю на месте (%s)" % (label, commit[:12]))
+        repo.pull(ref, dest, label)
+        with open(os.path.join(dest, ".commit"), "w") as f:
+            f.write(commit)
+        return True
+    staging, old = dest + ".new", dest + ".old"
+    marker = os.path.join(staging, ".pulling")
+    if os.path.isdir(staging) and read_text(marker) != commit:
+        shutil.rmtree(staging)
+    os.makedirs(staging, exist_ok=True)
+    with open(marker, "w") as f:
+        f.write(commit)
+    print("[%s] %s, коммит %s" % (label, ref, commit[:12]))
+    repo.pull(ref, staging, label)
+    os.remove(marker)
+    with open(os.path.join(staging, ".commit"), "w") as f:
+        f.write(commit)
+    if os.path.exists(dest):
+        shutil.rmtree(old, ignore_errors=True)
+        os.rename(dest, old)
+    os.rename(staging, dest)
+    shutil.rmtree(old, ignore_errors=True)
+    return True
+
+
+def find_app_ref(repo, appid, arch, branch):
+    tried = [branch] if branch else BRANCH_GUESS
+    for b in tried:
+        ref = "app/%s/%s/%s" % (appid, arch, b)
+        if repo.head_opt(ref) is not None:
+            return ref, b
+    die("в %s нет приложения %s (пробовал ветки: %s). Укажите --branch/--remote."
+        % (repo.base, appid, ", ".join(tried)))
+
+
+def app_dir(appid, branch):
+    return P("apps", appid, branch)
+
+
+def runtime_dir(rid, rarch, rbranch):
+    return P("runtimes", rid, rarch, rbranch)
+
+
+def load_info(appid, branch=None):
+    base = P("apps", appid)
+    if not os.path.isdir(base):
+        die("%s не установлено" % appid)
+    brs = sorted(b for b in os.listdir(base)
+                 if os.path.isfile(os.path.join(base, b, "info.json")))
+    if not brs:
+        die("%s не установлено" % appid)
+    if branch is None:
+        if len(brs) > 1:
+            die("несколько веток (%s): укажите --branch" % ", ".join(brs))
+        branch = brs[0]
+    elif branch not in brs:
+        die("ветка %s не установлена (есть: %s)" % (branch, ", ".join(brs)))
+    with open(os.path.join(base, branch, "info.json")) as f:
+        return json.load(f)
+
+
+def app_metadata(adir):
+    return parse_ini(read_text(os.path.join(adir, "metadata")) or "")
+
+
+def install_runtime(info, jobs, force=False):
+    rid, rarch, rbranch = split_ref(info["runtime"])
+    ref = "runtime/%s" % info["runtime"]
+    cands = []
+    for spec in (info.get("runtime_remote"), info.get("remote"), DEFAULT_REMOTE):
+        if spec:
+            url = resolve_remote(spec)
+            if url not in cands:
+                cands.append(url)
+    for url in cands:
+        repo = Repo(url, jobs)
+        if repo.head_opt(ref) is not None:
+            sync(repo, ref, runtime_dir(rid, rarch, rbranch), "рантайм " + rid, force)
+            return
+    die("рантайм %s не найден ни в одном репозитории: %s" % (ref, ", ".join(cands)))
+
+
+def do_install(t, jobs, force=False):
+    appid, arch = t["id"], t["arch"]
+    app_url = resolve_remote(t.get("remote"))
+    repo = Repo(app_url, jobs)
+    ref, branch = find_app_ref(repo, appid, arch, t.get("branch"))
+    adir = app_dir(appid, branch)
+    os.makedirs(os.path.dirname(adir), exist_ok=True)
+    sync(repo, ref, adir, appid, force)
+    meta = app_metadata(adir).get("Application", {})
+    if not meta.get("runtime"):
+        die("в metadata нет runtime=. Это точно приложение, а не рантайм?")
+    info = {"id": appid, "branch": branch, "arch": arch, "remote": app_url,
+            "runtime_remote": t.get("runtime_remote"), "runtime": meta["runtime"],
+            "command": meta.get("command", appid)}
+    install_runtime(info, jobs, force)
+    with open(os.path.join(adir, "info.json"), "w") as f:
+        json.dump(info, f, indent=1)
+    wrap(info)
+    return info
+
+
+# ------------------------------------------------------------ обёртки
+def elf_interp(path):
+    """True для динамически слинкованного исполняемого ELF64 LE (есть PT_INTERP)."""
+    try:
+        with open(path, "rb") as f:
+            h = f.read(64)
+            if len(h) < 64 or h[:4] != b"\x7fELF" or h[4] != 2 or h[5] != 1:
+                return False
+            phoff = int.from_bytes(h[32:40], "little")
+            phsz = int.from_bytes(h[54:56], "little")
+            phnum = int.from_bytes(h[56:58], "little")
+            f.seek(phoff)
+            ph = f.read(phsz * phnum)
+    except OSError:
+        return False
+    return any(int.from_bytes(ph[i * phsz:i * phsz + 4], "little") == 3
+               for i in range(phnum))
+
+
+def paths_for(info):
+    adir = app_dir(info["id"], info["branch"])
+    rid, rarch, rbranch = split_ref(info["runtime"])
+    rdir = runtime_dir(rid, rarch, rbranch)
+    return os.path.join(adir, "files"), os.path.join(rdir, "files"), rdir
+
+
+def find_ld(rfiles, arch):
+    for rel in ARCH_INFO.get(arch, ARCH_INFO["x86_64"])[1]:
+        p = os.path.join(rfiles, rel)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def lib_path(afiles, rfiles, arch):
+    tri = ARCH_INFO.get(arch, ARCH_INFO["x86_64"])[0]
+    return ":".join([afiles + "/lib64", afiles + "/lib", afiles + "/lib/" + tri,
+                     rfiles + "/lib/" + tri, rfiles + "/lib", rfiles + "/lib64"])
+
+
+def command_path(info, afiles):
+    c = info.get("command") or info["id"]
+    if c.startswith("/app/"):
+        return os.path.join(afiles, c[5:])
+    if c.startswith("/"):
+        return c
+    return os.path.join(afiles, "bin", c)
+
+
+WRAP_TMPL = """#!/bin/sh
+# сгенерировано flatpak-freebsd.py: запуск через загрузчик рантайма
+exec {ld} \\
+  --library-path {libs} \\
+  {real} "$@"
+"""
+
+
+def wrap(info, quiet=False):
+    """Вспомогательные программы приложения (их оно зовёт по /app/...) запускаем
+    через загрузчик рантайма: системный glibc Linuxulator для них слишком старый."""
+    afiles, rfiles, _ = paths_for(info)
+    ld = find_ld(rfiles, info["arch"])
+    if ld is None:
+        die("в рантайме нет загрузчика ld-linux (arch=%s)" % info["arch"])
+    libs = lib_path(afiles, rfiles, info["arch"])
+    main = os.path.realpath(command_path(info, afiles))
+    count = 0
+    for d, dirs, files in os.walk(afiles):
+        dirs[:] = [x for x in dirs if x not in ("share", "include")]
+        for name in files:
+            if name.endswith(".real") or ".so" in name:
+                continue
+            p = os.path.join(d, name)
+            if os.path.islink(p):
+                continue
+            real = p + ".real"
+            if os.path.exists(real):
+                pass                                   # обёртка уже есть: пересоздаём пути
+            elif os.path.realpath(p) == main or not elf_interp(p):
+                continue
+            else:
+                os.rename(p, real)
+            tmp = p + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(WRAP_TMPL.format(ld=shlex.quote(ld), libs=shlex.quote(libs),
+                                         real=shlex.quote(real)))
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, p)
+            count += 1
+    if not quiet:
+        print("обёртки: %d" % count)
+    return count
+
+
+# ------------------------------------------------------------ ссылка /app
+def link_path():
+    return "/compat/linux/app" if os.path.isdir("/compat/linux") else "/app"
+
+
+def link_ok(afiles):
+    link = link_path()
+    return os.path.islink(link) and os.path.realpath(link) == os.path.realpath(afiles)
+
+
+def ensure_link(afiles, quiet=False):
+    link = link_path()
+    if link_ok(afiles):
+        return True
+    try:
+        if os.path.islink(link):
+            os.unlink(link)
+        os.symlink(afiles, link)
+        print("создана ссылка %s -> %s" % (link, afiles))
+        return True
+    except OSError:
+        if not quiet:
+            print("\nМногие приложения зовут свои программы по пути /app. Выполните от root:")
+            print("  sudo ln -sfn %s %s\n" % (shlex.quote(afiles), link))
+        return False
+
+
+# ------------------------------------------------------------ запуск
+def linux_loaded():
+    try:
+        dn = subprocess.DEVNULL
+        if subprocess.run(["sysctl", "-n", "compat.linux.osrelease"],
+                          stdout=dn, stderr=dn).returncode == 0:
+            return True
+        return subprocess.run(["kldstat", "-q", "-m", "linux64"], stderr=dn).returncode == 0
+    except OSError:
+        return None
+
+
+def read_env_file(path):
+    out = {}
+    txt = read_text(path)
+    for line in (txt or "").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def gio_tls_dir(rdir, rfiles, arch):
+    """Каталог только с TLS-модулем GLib: путь по умолчанию в Linuxulator не существует."""
+    tri = ARCH_INFO.get(arch, ARCH_INFO["x86_64"])[0]
+    src = os.path.join(rfiles, "lib", tri, "gio", "modules", "libgiognutls.so")
+    if not os.path.exists(src):
+        return None
+    d = os.path.join(rdir, "gio-tls")
+    os.makedirs(d, exist_ok=True)
+    dst = os.path.join(d, "libgiognutls.so")
+    if not os.path.lexists(dst):
+        os.symlink(src, dst)
+    return d
+
+
+def do_run(info, extra, isolate=False):
+    afiles, rfiles, rdir = paths_for(info)
+    arch = info["arch"]
+    ld = find_ld(rfiles, arch)
+    cmd = command_path(info, afiles)
+    if ld is None or not os.path.exists(cmd):
+        die("приложение не готово. Выполните: install %s" % info["id"])
+    if linux_loaded() is False:
+        print("предупреждение: Linuxulator не загружен (service linux start)", file=sys.stderr)
+    if not link_ok(afiles) and not ensure_link(afiles):
+        print("предупреждение: /app указывает не туда; приложения, зовущие /app/..., "
+              "могут не запуститься", file=sys.stderr)
+
+    merged = dict(ENV_DEFAULTS)
+    merged.update(read_env_file(P("env")))
+    merged.update(read_env_file(P("apps", info["id"], "env")))
+    gd = gio_tls_dir(rdir, rfiles, arch)
+    if gd:
+        merged.setdefault("GIO_MODULE_DIR", gd)
+    merged["FLATPAK_ID"] = info["id"]
+    env = dict(os.environ)
+    for k, v in merged.items():
+        env.setdefault(k, v)
+    ours = "%s/share:%s/share" % (afiles, rfiles)
+    env["XDG_DATA_DIRS"] = ours + (":" + env["XDG_DATA_DIRS"] if env.get("XDG_DATA_DIRS") else "")
+    if isolate:
+        var = os.path.expanduser("~/.var/app/%s" % info["id"])
+        for k, sub in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
+                       ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")):
+            os.makedirs(os.path.join(var, sub), exist_ok=True)
+            env[k] = os.path.join(var, sub)
+    if not env.get("DISPLAY"):
+        print("предупреждение: DISPLAY не задан", file=sys.stderr)
+    if elf_interp(cmd):
+        argv = [ld, "--library-path", lib_path(afiles, rfiles, arch), cmd] + extra
+    else:
+        argv = [cmd] + extra
+    os.execve(argv[0], argv, env)
+
+
+# ------------------------------------------------------------ команды
+def make_target(a):
+    arch = getattr(a, "arch", None) or host_arch()
+    t = {"id": a.target, "branch": getattr(a, "branch", None), "arch": arch,
+         "remote": getattr(a, "remote", None),
+         "runtime_remote": getattr(a, "runtime_remote", None)}
+    if a.target.endswith(".flatpakref"):
+        s = parse_ini(fetch_text(a.target)).get("Flatpak Ref", {})
+        if not s.get("Name"):
+            die("в %s нет Name=" % a.target)
+        if s.get("IsRuntime", "").lower() == "true":
+            die("это ссылка на рантайм, а не на приложение")
+        t["id"] = s["Name"]
+        t["branch"] = t["branch"] or s.get("Branch")
+        t["remote"] = t["remote"] or s.get("Url")
+        t["runtime_remote"] = t["runtime_remote"] or s.get("RuntimeRepo")
+    elif not re.match(r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_-]+)+$", a.target):
+        die("не похоже на ID приложения: %s" % a.target)
+    return t
+
+
+def installed_list():
+    out = []
+    base = P("apps")
+    if os.path.isdir(base):
+        for aid in sorted(os.listdir(base)):
+            for br in sorted(os.listdir(os.path.join(base, aid))):
+                if os.path.isfile(os.path.join(base, aid, br, "info.json")):
+                    out.append((aid, br))
+    return out
+
+
+def cmd_list():
+    items = installed_list()
+    if not items:
+        print("ничего не установлено")
+    for aid, br in items:
+        info = load_info(aid, br)
+        c = (read_text(os.path.join(app_dir(aid, br), ".commit")) or "?")[:12]
+        print("%-40s %-8s %s  runtime=%s" % (aid, br, c, info["runtime"]))
+
+
+def cmd_update(a):
+    items = [(a.target, a.branch)] if a.target else installed_list()
+    if not items:
+        print("нечего обновлять")
+    for aid, br in items:
+        info = load_info(aid, br)
+        print("== %s (%s)" % (aid, info["branch"]))
+        t = {"id": aid, "branch": info["branch"], "arch": info["arch"],
+             "remote": info["remote"], "runtime_remote": info.get("runtime_remote")}
+        do_install(t, a.jobs, a.force)
+
+
+def cmd_remove(a):
+    info = load_info(a.target, a.branch)
+    shutil.rmtree(app_dir(info["id"], info["branch"]))
+    base = P("apps", info["id"])
+    if not [x for x in os.listdir(base) if os.path.isdir(os.path.join(base, x))]:
+        shutil.rmtree(base)
+    print("удалено:", info["id"])
+    if a.prune:
+        used = set()
+        for aid, br in installed_list():
+            used.add(load_info(aid, br)["runtime"])
+        rbase = P("runtimes")
+        for rid in (os.listdir(rbase) if os.path.isdir(rbase) else []):
+            for ra in os.listdir(os.path.join(rbase, rid)):
+                for rb in os.listdir(os.path.join(rbase, rid, ra)):
+                    if "%s/%s/%s" % (rid, ra, rb) not in used:
+                        shutil.rmtree(os.path.join(rbase, rid, ra, rb))
+                        print("удалён рантайм: %s/%s/%s" % (rid, ra, rb))
+
+
+def cmd_check():
+    ll = linux_loaded()
+    rows = [
+        ("Linuxulator", {True: "включён", False: "НЕ включён: service linux start",
+                         None: "не удалось проверить"}[ll]),
+        ("resolv.conf (Linux)", "ok" if os.path.exists("/compat/linux/etc/resolv.conf")
+         else "нет: sudo cp /etc/resolv.conf /compat/linux/etc/"),
+        ("корневые сертификаты", "ok" if os.path.exists(
+            "/compat/linux/etc/ssl/certs/ca-certificates.crt") else
+         "нет: pkg install ca_root_nss; ln -s /usr/local/share/certs/ca-root-nss.crt "
+         "/compat/linux/etc/ssl/certs/ca-certificates.crt"),
+        ("ссылка %s" % link_path(), os.path.realpath(link_path())
+         if os.path.islink(link_path()) else "нет"),
+        ("DISPLAY", os.environ.get("DISPLAY") or "не задан"),
+        ("архитектура", host_arch()),
+        ("каталог данных", ROOT),
+        ("установлено", "%d" % len(installed_list())),
+    ]
+    for k, v in rows:
+        print("%-22s %s" % (k, v))
+
+
+def main():
+    global ROOT
+    ap = argparse.ArgumentParser(description="Flatpak на FreeBSD через Linuxulator",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__)
+    ap.add_argument("--root", default=os.environ.get(
+        "FLATPAK_FB_ROOT", os.path.expanduser("~/.local/share/flatpak-freebsd")))
+    ap.add_argument("-j", "--jobs", type=int, default=16)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add_install_opts(p):
+        p.add_argument("target")
+        p.add_argument("--remote")
+        p.add_argument("--runtime-remote")
+        p.add_argument("--branch")
+        p.add_argument("--arch")
+        p.add_argument("--force", action="store_true")
+
+    for name in ("install", "start"):
+        add_install_opts(sub.add_parser(name))
+    sub.choices["start"].add_argument("--isolate", action="store_true",
+                                      help="данные приложения в ~/.var/app/ID, как во Flatpak")
+    sub.choices["start"].add_argument("rest", nargs=argparse.REMAINDER)
+    p = sub.add_parser("run")
+    p.add_argument("target")
+    p.add_argument("--branch")
+    p.add_argument("--isolate", action="store_true")
+    p.add_argument("rest", nargs=argparse.REMAINDER)
+    p = sub.add_parser("update")
+    p.add_argument("target", nargs="?")
+    p.add_argument("--branch")
+    p.add_argument("--force", action="store_true")
+    sub.add_parser("list")
+    sub.add_parser("check")
+    for name in ("info", "link", "wrap"):
+        p = sub.add_parser(name)
+        p.add_argument("target")
+        p.add_argument("--branch")
+    p = sub.add_parser("remove")
+    p.add_argument("target")
+    p.add_argument("--branch")
+    p.add_argument("--prune", action="store_true")
+
+    a = ap.parse_args()
+    ROOT = os.path.abspath(a.root)
+    os.makedirs(ROOT, exist_ok=True)
+    extra = [x for x in getattr(a, "rest", []) if x != "--"]
+
+    if a.cmd == "install":
+        info = do_install(make_target(a), a.jobs, a.force)
+        ensure_link(paths_for(info)[0])
+        print("готово. Запуск: %s run %s" % (sys.argv[0], info["id"]))
+    elif a.cmd == "start":
+        t = make_target(a)
+        try:
+            info = load_info(t["id"], t["branch"])
+            if find_ld(paths_for(info)[1], info["arch"]) is None:
+                raise SystemExit
+        except SystemExit:
+            print("не установлено, ставлю (может занять время)")
+            info = do_install(t, a.jobs, a.force)
+        do_run(info, extra, a.isolate)
+    elif a.cmd == "run":
+        do_run(load_info(a.target, a.branch), extra, a.isolate)
+    elif a.cmd == "update":
+        cmd_update(a)
+    elif a.cmd == "list":
+        cmd_list()
+    elif a.cmd == "info":
+        info = load_info(a.target, a.branch)
+        print(json.dumps(info, indent=1, ensure_ascii=False))
+        print("файлы приложения:", paths_for(info)[0])
+    elif a.cmd == "remove":
+        cmd_remove(a)
+    elif a.cmd == "link":
+        ensure_link(paths_for(load_info(a.target, a.branch))[0])
+    elif a.cmd == "wrap":
+        wrap(load_info(a.target, a.branch))
+    elif a.cmd == "check":
+        cmd_check()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        die("\nпрервано (повторный запуск продолжит с места остановки)")
