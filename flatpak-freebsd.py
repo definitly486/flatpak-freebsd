@@ -83,6 +83,7 @@ ENV_DEFAULTS = {
     "LIBGL_ALWAYS_SOFTWARE": "1",
     "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS": "1",   # bwrap в Linuxulator нет
     "WEBKIT_DISABLE_COMPOSITING_MODE": "1",
+    "WEBKIT_DISABLE_DMABUF_RENDERER": "1",              # нет DRM/GBM: иначе пустой webview
     "GTK_A11Y": "none",
     "NO_AT_BRIDGE": "1",
     "GIO_USE_PROXY_RESOLVER": "dummy",
@@ -888,28 +889,53 @@ def typelib_path(afiles, rfiles, arch):
 
 
 def usr_link_specs(rfiles, arch):
-    """Каталоги WebKit в рантайме: [(путь относительно /usr, реальный каталог)]."""
+    """Каталоги рантайма, которые должны быть видны по «системным» путям:
+    [(путь от корня /compat/linux, реальный каталог)]."""
     import glob
     tri = ARCH_INFO.get(arch, ARCH_INFO["x86_64"])[0]
     out = []
+    # WebKitGTK: вспомогательные процессы и injected-bundle (пути зашиты при сборке)
     for pat in ("libexec/webkit*gtk-*", "lib/%s/webkit*gtk-*" % tri):
         for d in sorted(glob.glob(os.path.join(rfiles, pat))):
             if os.path.isdir(d):
-                out.append((os.path.relpath(d, rfiles), d))
+                out.append(("usr/" + os.path.relpath(d, rfiles), d))
+    # p11-kit: каталог модулей (libp11-kit ищет p11-kit-trust.so в /usr/lib/<tri>/pkcs11)
+    d = os.path.join(rfiles, "lib", tri, "pkcs11")
+    if os.path.isdir(d):
+        out.append(("usr/lib/%s/pkcs11" % tri, d))
+    # p11-kit-trust (GnuTLS/glib-networking): корневые сертификаты рантайма
+    for guest, sub in (("usr/share/pki/ca-trust-source", "share/pki/ca-trust-source"),
+                       ("etc/pki/ca-trust/source", "etc/pki/ca-trust/source")):
+        d = os.path.join(rfiles, sub)
+        if os.path.isdir(d):
+            out.append((guest, d))
     return out
 
 
+def p11_trust_config_ok():
+    """Есть ли в Linux-деревьях конфиг модуля p11-kit-trust (иначе доверия нет вовсе)."""
+    import glob
+    for pat in ("/compat/linux/usr/share/p11-kit/modules/*.module",
+                "/compat/linux/etc/pkcs11/modules/*.module"):
+        for f in glob.glob(pat):
+            if "p11-kit-trust" in (read_text(f) or ""):
+                return True
+    return False
+
+
 def ensure_usr_links(rfiles, arch, quiet=False):
-    """Путь /usr/libexec/webkit2gtk-4.1 зашит в libwebkit2gtk и от WEBKIT_EXEC_PATH
-    в release-сборках может не зависеть. Поэтому, как и с /app, делаем один раз
-    root-ссылку  /compat/linux/usr/REL -> ROOT/.usr/REL  и переключаем только
-    пользовательскую часть ROOT/.usr/REL -> каталог рантайма текущего приложения."""
+    """Некоторые пути зашиты в библиотеки рантайма (/usr/libexec/webkit2gtk-4.1,
+    /usr/share/pki/ca-trust-source), а в Linuxulator /usr и /etc указывают в
+    /compat/linux. Как и с /app, один раз делаем root-ссылку
+        /compat/linux/ПУТЬ -> ROOT/.usr/ПУТЬ  (или ROOT/.guest/ПУТЬ)
+    и переключаем без root только вторую часть: она ведёт в каталог рантайма
+    текущего приложения. Настоящие каталоги в /compat/linux не трогаем."""
     base = "/compat/linux"
     if not os.path.isdir(base):
         return True
-    missing = []
-    for rel, real in usr_link_specs(rfiles, arch):
-        sw = P(".usr", rel)
+    missing, conflicts = [], []
+    for grel, real in usr_link_specs(rfiles, arch):
+        sw = P(".usr", grel[4:]) if grel.startswith("usr/") else P(".guest", grel)
         os.makedirs(os.path.dirname(sw), exist_ok=True)
         tmp = sw + ".tmp-%d" % os.getpid()
         try:
@@ -920,20 +946,54 @@ def ensure_usr_links(rfiles, arch, quiet=False):
         except OSError as e:
             warn("не удалось переключить %s: %s" % (sw, e))
             continue
-        guest = os.path.join(base, "usr", rel)
+        guest = os.path.join(base, grel)
         try:
             ok = os.path.islink(guest) and os.path.abspath(os.readlink(guest)) == os.path.abspath(sw)
         except OSError:
             ok = False
-        if not ok:
+        if ok:
+            continue
+        if os.path.lexists(guest) and not os.path.islink(guest):
+            conflicts.append(guest)
+        else:
             missing.append((guest, sw))
-    if missing and not quiet:
-        print("\nWebKit ищет свои процессы по фиксированному пути. Один раз от root:")
-        for guest, sw in missing:
-            print("  sudo mkdir -p %s && sudo ln -sfn %s %s" % (
-                shlex.quote(os.path.dirname(guest)), shlex.quote(sw), shlex.quote(guest)))
-        print()
-    return not missing
+    if (missing or conflicts) and not quiet:
+        if missing:
+            print("\nНужны постоянные ссылки на каталоги рантайма. Один раз от root:")
+            for guest, sw in missing:
+                print("  sudo mkdir -p %s && sudo ln -sfn %s %s" % (
+                    shlex.quote(os.path.dirname(guest)), shlex.quote(sw), shlex.quote(guest)))
+            print()
+        if not p11_trust_config_ok():
+            print("Нет конфига модуля p11-kit-trust: без него корневых сертификатов не будет."
+                  " Создайте новый файл (существующие не меняются):")
+            print("  sudo mkdir -p /compat/linux/etc/pkcs11/modules && printf '%s\\n' "
+                  "'module: p11-kit-trust.so' 'trust-policy: yes' "
+                  "'x-trust-lookup: pkcs11:library-description=PKCS%2311%20Kit%20Trust%20Module' "
+                  "| sudo tee /compat/linux/etc/pkcs11/modules/p11-kit-trust.module\n")
+        for guest in conflicts:
+            print("внимание: %s уже существует как обычный каталог (не ссылка), "
+                  "ссылку не предлагаю: проверьте его вручную." % guest, file=sys.stderr)
+    return not missing and not conflicts
+
+
+GL_EXT = "org.freedesktop.Platform.GL.default"
+
+
+def gl_version(rdir):
+    """Ветка расширения Mesa из metadata рантайма (секция Extension ...Platform.GL)."""
+    sec = app_metadata(rdir).get("Extension org.freedesktop.Platform.GL", {})
+    v = (sec.get("versions") or sec.get("version") or "").split(";")[0].strip()
+    return v or None
+
+
+def gl_files(rdir, arch):
+    """Каталог files/ скачанной Mesa для этого рантайма или None."""
+    ver = gl_version(rdir)
+    if not ver:
+        return None
+    d = P("runtimes", GL_EXT, arch, ver, "files")
+    return d if os.path.isdir(d) else None
 
 
 def do_run(info, extra, isolate=False):
@@ -965,6 +1025,15 @@ def do_run(info, extra, isolate=False):
     if pick_webkit(wb):
         merged.setdefault("WEBKIT_INJECTED_BUNDLE_PATH", pick_webkit(wb))
     merged["FLATPAK_ID"] = info["id"]
+    want_gl = (os.environ.get("FB_GL") or merged.get("FB_GL")) == "1"
+    glf = gl_files(rdir, arch) if want_gl else None
+    if want_gl and not glf:
+        warn("FB_GL=1, но Mesa не скачана: %s gl %s" % (os.path.basename(sys.argv[0]), info["id"]))
+    if glf:                                            # Mesa (llvmpipe) из расширения GL.default
+        merged.setdefault("__EGL_VENDOR_LIBRARY_DIRS", glf + "/share/glvnd/egl_vendor.d")
+        merged.setdefault("LIBGL_DRIVERS_PATH", glf + "/lib/dri")
+        merged.setdefault("__GLX_VENDOR_LIBRARY_NAME", "mesa")
+        merged.setdefault("GALLIUM_DRIVER", "llvmpipe")
     env = dict(os.environ)
     for k, v in merged.items():
         env.setdefault(k, v)
@@ -985,6 +1054,8 @@ def do_run(info, extra, isolate=False):
     if not env.get("DISPLAY"):
         print("предупреждение: DISPLAY не задан", file=sys.stderr)
     lp = lib_path(afiles, rfiles, arch)
+    if glf:
+        lp = glf + "/lib:" + lp
     env["LD_LIBRARY_PATH"] = lp + (":" + env["LD_LIBRARY_PATH"]
                                    if env.get("LD_LIBRARY_PATH") else "")
     if elf_interp(cmd):
@@ -1421,11 +1492,42 @@ def cmd_remove(a):
             used.add(load_info(aid, br)["runtime"])
         rbase = P("runtimes")
         for rid in (os.listdir(rbase) if os.path.isdir(rbase) else []):
+            if rid == GL_EXT:                          # Mesa не указана в metadata приложений
+                continue
             for ra in os.listdir(os.path.join(rbase, rid)):
                 for rb in os.listdir(os.path.join(rbase, rid, ra)):
                     if "%s/%s/%s" % (rid, ra, rb) not in used:
                         shutil.rmtree(os.path.join(rbase, rid, ra, rb))
                         print("удалён рантайм: %s/%s/%s" % (rid, ra, rb))
+
+
+def cmd_gl(a, jobs):
+    """Скачать Mesa (расширение GL.default) для рантайма приложения и включить её для него."""
+    info = load_info(a.target, a.branch)
+    _, _, rdir = paths_for(info)
+    ver = gl_version(rdir)
+    if not ver:
+        die("в metadata рантайма нет секции Extension org.freedesktop.Platform.GL")
+    ref = "runtime/%s/%s/%s" % (GL_EXT, info["arch"], ver)
+    cands = []
+    for spec in (info.get("runtime_remote"), info.get("remote"), DEFAULT_REMOTE):
+        if spec:
+            url = resolve_remote(spec)
+            if url not in cands:
+                cands.append(url)
+    for url in cands:
+        repo = Repo(url, jobs)
+        if repo.head_opt(ref) is not None:
+            sync(repo, ref, P("runtimes", GL_EXT, info["arch"], ver), "Mesa " + ver)
+            break
+    else:
+        die("%s не найден ни в одном репозитории: %s" % (ref, ", ".join(cands)))
+    envp = P("apps", info["id"], "env")
+    txt = read_text(envp) or ""
+    if "FB_GL=" not in txt:
+        with open(envp, "a") as f:
+            f.write(("\n" if txt else "") + "FB_GL=1\n")
+    print("Mesa %s готова и включена для %s (FB_GL=1 в %s)" % (ver, info["id"], envp))
 
 
 def cmd_check():
@@ -1803,7 +1905,7 @@ def main():
     p.add_argument("--cached", action="store_true",
                    help="не проверять репозиторий, если каталог уже сохранён")
     p.add_argument("--json", action="store_true", help="вывод в JSON")
-    for name in ("info", "link", "wrap"):
+    for name in ("info", "link", "wrap", "gl"):
         p = sub.add_parser(name)
         p.add_argument("target")
         p.add_argument("--branch")
@@ -1851,6 +1953,8 @@ def main():
         ensure_usr_links(paths_for(li)[1], li["arch"])
     elif a.cmd == "wrap":
         wrap(load_info(a.target, a.branch))
+    elif a.cmd == "gl":
+        cmd_gl(a, a.jobs)
     elif a.cmd == "check":
         cmd_check()
     elif a.cmd == "gui":
