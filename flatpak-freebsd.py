@@ -16,6 +16,7 @@ flatpak-freebsd: скачивание и запуск Flatpak-приложени
   link ID          ссылка /app -> файлы приложения (нужен root, один раз)
   wrap ID          пересоздать обёртки для вспомогательных процессов
   check            диагностика окружения
+  gui              графический интерфейс (tkinter)
 
 ЦЕЛЬ: ID приложения (org.mozilla.firefox), либо путь/URL к .flatpakref.
 Репозиторий задаётся --remote: flathub (по умолчанию), flathub-beta,
@@ -756,6 +757,20 @@ def resolve_interp(interp, afiles, rfiles):
     return None
 
 
+def typelib_path(afiles, rfiles, arch):
+    """Каталоги с typelib для GObject Introspection (Python gi и др.): путь по умолчанию
+    в Linuxulator ведёт в /compat/linux/usr/lib, где их нет."""
+    tri = ARCH_INFO.get(arch, ARCH_INFO["x86_64"])[0]
+    out = []
+    for base in (afiles, rfiles):
+        for sub in ("lib/girepository-1.0", "lib/%s/girepository-1.0" % tri,
+                    "lib64/girepository-1.0"):
+            d = os.path.join(base, sub)
+            if os.path.isdir(d) and d not in out:
+                out.append(d)
+    return out
+
+
 def do_run(info, extra, isolate=False):
     afiles, rfiles, rdir = paths_for(info)
     arch = info["arch"]
@@ -781,6 +796,10 @@ def do_run(info, extra, isolate=False):
     env = dict(os.environ)
     for k, v in merged.items():
         env.setdefault(k, v)
+    tl = typelib_path(afiles, rfiles, arch)
+    if tl:
+        env["GI_TYPELIB_PATH"] = ":".join(tl + ([env["GI_TYPELIB_PATH"]]
+                                                if env.get("GI_TYPELIB_PATH") else []))
     ours = "%s/share:%s/share" % (afiles, rfiles)
     env["XDG_DATA_DIRS"] = ours + (":" + env["XDG_DATA_DIRS"] if env.get("XDG_DATA_DIRS") else "")
     env["PATH"] = ":".join([os.path.join(afiles, "bin"), os.path.join(rfiles, "bin"),
@@ -1259,6 +1278,298 @@ def cmd_check():
         print("%-22s %s" % (k, v))
 
 
+
+# ------------------------------------------------------------ графический режим
+def cmd_gui(a):
+    try:
+        import tkinter as tk
+        from tkinter import ttk, messagebox, scrolledtext
+    except ImportError:
+        die("для gui нужен tkinter: pkg install py%d%d-tkinter" %
+            (sys.version_info.major, sys.version_info.minor))
+
+    jobs = a.jobs
+    arch = host_arch()
+    langs = detect_langs(None)
+    remote_url = resolve_remote(DEFAULT_REMOTE)
+
+    root = tk.Tk()
+    root.title("Flatpak FreeBSD")
+    root.geometry("920x620")
+    root.minsize(700, 480)
+
+    status = tk.StringVar(value="Готово")
+    busy = {"v": False}
+
+    top = ttk.Frame(root, padding=6)
+    top.pack(fill=tk.X)
+    ttk.Label(top, text="Поиск:").pack(side=tk.LEFT)
+    search_var = tk.StringVar()
+    search_entry = ttk.Entry(top, textvariable=search_var, width=40)
+    search_entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+
+    nb = ttk.Notebook(root)
+    nb.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+
+    tab_inst = ttk.Frame(nb)
+    nb.add(tab_inst, text="Установленные")
+    cols_i = ("id", "branch", "runtime")
+    tree_i = ttk.Treeview(tab_inst, columns=cols_i, show="headings", selectmode="browse")
+    tree_i.heading("id", text="ID")
+    tree_i.heading("branch", text="Ветка")
+    tree_i.heading("runtime", text="Рантайм")
+    tree_i.column("id", width=280)
+    tree_i.column("branch", width=80)
+    tree_i.column("runtime", width=320)
+    sb_i = ttk.Scrollbar(tab_inst, orient=tk.VERTICAL, command=tree_i.yview)
+    tree_i.configure(yscrollcommand=sb_i.set)
+    tree_i.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    sb_i.pack(side=tk.RIGHT, fill=tk.Y)
+
+    tab_srch = ttk.Frame(nb)
+    nb.add(tab_srch, text="Каталог")
+    cols_s = ("name", "id", "branch", "summary")
+    tree_s = ttk.Treeview(tab_srch, columns=cols_s, show="headings", selectmode="browse")
+    tree_s.heading("name", text="Название")
+    tree_s.heading("id", text="ID")
+    tree_s.heading("branch", text="Ветка")
+    tree_s.heading("summary", text="Описание")
+    tree_s.column("name", width=180)
+    tree_s.column("id", width=240)
+    tree_s.column("branch", width=70)
+    tree_s.column("summary", width=320)
+    sb_s = ttk.Scrollbar(tab_srch, orient=tk.VERTICAL, command=tree_s.yview)
+    tree_s.configure(yscrollcommand=sb_s.set)
+    tree_s.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    sb_s.pack(side=tk.RIGHT, fill=tk.Y)
+
+    tab_log = ttk.Frame(nb)
+    nb.add(tab_log, text="Лог")
+    log_txt = scrolledtext.ScrolledText(tab_log, height=12, state=tk.DISABLED,
+                                        wrap=tk.WORD, font=("TkFixedFont", 10))
+    log_txt.pack(fill=tk.BOTH, expand=True)
+
+    btn_frame = ttk.Frame(root, padding=6)
+    btn_frame.pack(fill=tk.X)
+    ttk.Label(btn_frame, textvariable=status).pack(side=tk.LEFT, padx=4)
+
+    def log(msg):
+        log_txt.configure(state=tk.NORMAL)
+        log_txt.insert(tk.END, msg + "\n")
+        log_txt.see(tk.END)
+        log_txt.configure(state=tk.DISABLED)
+
+    def set_busy(v, msg=None):
+        busy["v"] = v
+        if msg is not None:
+            status.set(msg)
+        for w in (btn_install, btn_run, btn_update, btn_remove, btn_search, btn_refresh):
+            w.configure(state=tk.DISABLED if v else tk.NORMAL)
+
+    def refresh_installed():
+        for i in tree_i.get_children():
+            tree_i.delete(i)
+        for aid, br in installed_list():
+            try:
+                info = load_info(aid, br)
+                tree_i.insert("", tk.END, iid="%s/%s" % (aid, br),
+                              values=(aid, br, info.get("runtime", "")))
+            except SystemExit:
+                tree_i.insert("", tk.END, iid="%s/%s" % (aid, br),
+                              values=(aid, br, "?"))
+
+    def selected_installed():
+        sel = tree_i.selection()
+        if not sel:
+            return None
+        parts = sel[0].split("/", 1)
+        return parts[0], parts[1] if len(parts) > 1 else None
+
+    def selected_search():
+        sel = tree_s.selection()
+        if not sel:
+            return None
+        vals = tree_s.item(sel[0], "values")
+        return {"id": vals[1], "branch": vals[2], "name": vals[0]}
+
+    def do_async(work, done_msg="Готово"):
+        if busy["v"]:
+            return
+        set_busy(True, "Работаю…")
+
+        def runner():
+            err = None
+            try:
+                work()
+            except SystemExit as e:
+                err = str(e) if e.args else "ошибка"
+            except Exception as e:
+                err = repr(e)
+
+            def finish():
+                set_busy(False, done_msg if not err else "Ошибка")
+                if err:
+                    log("ОШИБКА: " + err)
+                    messagebox.showerror("Ошибка", err)
+                refresh_installed()
+            root.after(0, finish)
+        threading.Thread(target=runner, daemon=True).start()
+
+    def on_search(_event=None):
+        words = [w.casefold() for w in search_var.get().split() if w]
+        set_busy(True, "Ищу…")
+        nb.select(tab_srch)
+
+        def work():
+            items = load_index(remote_url, DEFAULT_REMOTE, arch, langs,
+                               cached=True, refresh=False)
+            rows = []
+            for it in items:
+                s = score(it, words) if words else 1
+                if s:
+                    rows.append((s, it))
+            rows.sort(key=lambda x: (-x[0], x[1]["name"].casefold()))
+
+            def fill():
+                for i in tree_s.get_children():
+                    tree_s.delete(i)
+                for _, it in rows[:200]:
+                    tree_s.insert("", tk.END,
+                                  values=(it["name"], it["id"], it["branch"],
+                                          it.get("summary", "")[:80]))
+                status.set("Найдено: %d (показано до 200)" % len(rows))
+                set_busy(False)
+            root.after(0, fill)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_refresh_catalog():
+        set_busy(True, "Обновляю каталог…")
+
+        def work():
+            load_index(remote_url, DEFAULT_REMOTE, arch, langs,
+                       cached=False, refresh=True)
+            root.after(0, lambda: (set_busy(False, "Каталог обновлён"), on_search()))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_install():
+        app = selected_search()
+        if not app:
+            q = search_var.get().strip()
+            if not q or " " in q:
+                messagebox.showinfo("Установка",
+                                    "Выберите приложение в каталоге "
+                                    "или введите точный ID в поле поиска")
+                return
+            app = {"id": q, "branch": None}
+        if not messagebox.askyesno("Установка", "Установить %s?" % app["id"]):
+            return
+
+        def work():
+            t = {"id": app["id"], "branch": app.get("branch"), "arch": arch,
+                 "remote": DEFAULT_REMOTE, "runtime_remote": None}
+            log("Установка %s…" % app["id"])
+            info = do_install(t, jobs)
+            ensure_link(paths_for(info)[0], quiet=True)
+            log("Готово: %s" % info["id"])
+        do_async(work, "Установлено")
+
+    def on_run():
+        sel = selected_installed()
+        if not sel:
+            messagebox.showinfo("Запуск", "Выберите установленное приложение")
+            return
+        aid, br = sel
+
+        def work():
+            info = load_info(aid, br)
+            log("Запуск %s…" % aid)
+            script = os.path.abspath(sys.argv[0])
+            cmd = [sys.executable, script, "--root", ROOT, "run", aid]
+            if br:
+                cmd += ["--branch", br]
+            subprocess.Popen(cmd, start_new_session=True)
+        do_async(work, "Запущено")
+
+    def on_update():
+        sel = selected_installed()
+        targets = [sel] if sel else installed_list()
+        if not targets:
+            messagebox.showinfo("Обновление", "Нечего обновлять")
+            return
+
+        def work():
+            for aid, br in targets:
+                info = load_info(aid, br)
+                log("Обновление %s (%s)…" % (aid, br))
+                t = {"id": aid, "branch": info["branch"], "arch": info["arch"],
+                     "remote": info["remote"],
+                     "runtime_remote": info.get("runtime_remote")}
+                do_install(t, jobs)
+            log("Обновление завершено")
+        do_async(work, "Обновлено")
+
+    def on_remove():
+        sel = selected_installed()
+        if not sel:
+            messagebox.showinfo("Удаление", "Выберите приложение")
+            return
+        aid, br = sel
+        if not messagebox.askyesno("Удаление", "Удалить %s (%s)?" % (aid, br)):
+            return
+
+        def work():
+            class A:
+                target = aid
+                branch = br
+                prune = False
+            cmd_remove(A())
+            log("Удалено: %s" % aid)
+        do_async(work, "Удалено")
+
+    def on_check():
+        nb.select(tab_log)
+        log("--- диагностика ---")
+        buf = io.StringIO()
+        old = sys.stdout
+        sys.stdout = buf
+        try:
+            cmd_check()
+        finally:
+            sys.stdout = old
+        log(buf.getvalue().rstrip())
+        status.set("Диагностика выполнена")
+
+    def on_dbl_inst(_event):
+        on_run()
+
+    def on_dbl_srch(_event):
+        on_install()
+
+    btn_search = ttk.Button(top, text="Найти", command=on_search)
+    btn_search.pack(side=tk.LEFT, padx=2)
+    btn_refresh = ttk.Button(top, text="Обновить каталог", command=on_refresh_catalog)
+    btn_refresh.pack(side=tk.LEFT, padx=2)
+
+    btn_install = ttk.Button(btn_frame, text="Установить", command=on_install)
+    btn_install.pack(side=tk.RIGHT, padx=2)
+    btn_run = ttk.Button(btn_frame, text="Запустить", command=on_run)
+    btn_run.pack(side=tk.RIGHT, padx=2)
+    btn_update = ttk.Button(btn_frame, text="Обновить", command=on_update)
+    btn_update.pack(side=tk.RIGHT, padx=2)
+    btn_remove = ttk.Button(btn_frame, text="Удалить", command=on_remove)
+    btn_remove.pack(side=tk.RIGHT, padx=2)
+    ttk.Button(btn_frame, text="Диагностика", command=on_check).pack(side=tk.RIGHT, padx=2)
+
+    search_entry.bind("<Return>", on_search)
+    tree_i.bind("<Double-1>", on_dbl_inst)
+    tree_s.bind("<Double-1>", on_dbl_srch)
+
+    refresh_installed()
+    log("Flatpak FreeBSD GUI. Каталог кэшируется; «Обновить каталог» — принудительно.")
+    root.mainloop()
+
+
+
 def main():
     global ROOT
     ap = argparse.ArgumentParser(description="Flatpak на FreeBSD через Linuxulator",
@@ -1293,6 +1604,7 @@ def main():
     p.add_argument("--force", action="store_true")
     sub.add_parser("list")
     sub.add_parser("check")
+    sub.add_parser("gui", help="графический интерфейс (нужен tkinter)")
     p = sub.add_parser("search", help="поиск в каталоге репозитория")
     p.add_argument("query", nargs="*", help="слова для поиска (без них — весь каталог)")
     p.add_argument("-r", "--remote", action="append",
@@ -1354,6 +1666,8 @@ def main():
         wrap(load_info(a.target, a.branch))
     elif a.cmd == "check":
         cmd_check()
+    elif a.cmd == "gui":
+        cmd_gui(a)
 
 
 if __name__ == "__main__":
