@@ -535,7 +535,8 @@ def find_ld(rfiles, arch):
 def lib_path(afiles, rfiles, arch):
     tri = ARCH_INFO.get(arch, ARCH_INFO["x86_64"])[0]
     return ":".join([afiles + "/lib64", afiles + "/lib", afiles + "/lib/" + tri,
-                     rfiles + "/lib/" + tri, rfiles + "/lib", rfiles + "/lib64"])
+                     rfiles + "/lib/" + tri, rfiles + "/lib/" + tri + "/pulseaudio",
+                     rfiles + "/lib", rfiles + "/lib64"])
 
 
 def command_path(info, afiles):
@@ -681,6 +682,8 @@ def do_run(info, extra, isolate=False):
         env.setdefault(k, v)
     ours = "%s/share:%s/share" % (afiles, rfiles)
     env["XDG_DATA_DIRS"] = ours + (":" + env["XDG_DATA_DIRS"] if env.get("XDG_DATA_DIRS") else "")
+    env["PATH"] = ":".join([os.path.join(afiles, "bin"), os.path.join(rfiles, "bin"),
+                            env.get("PATH", "/usr/bin:/bin")])
     if isolate:
         var = os.path.expanduser("~/.var/app/%s" % info["id"])
         for k, sub in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
