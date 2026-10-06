@@ -85,6 +85,12 @@ ENV_DEFAULTS = {
     "GTK_A11Y": "none",
     "NO_AT_BRIDGE": "1",
     "GIO_USE_PROXY_RESOLVER": "dummy",
+    # песочницы Mozilla (seccomp, user namespaces) в Linuxulator недоступны
+    "MOZ_DISABLE_CONTENT_SANDBOX": "1",
+    "MOZ_DISABLE_GMP_SANDBOX": "1",
+    "MOZ_DISABLE_RDD_SANDBOX": "1",
+    "MOZ_DISABLE_SOCKET_PROCESS_SANDBOX": "1",
+    "MOZ_DISABLE_UTILITY_SANDBOX": "1",
 }
 
 ROOT = None
@@ -548,92 +554,113 @@ def command_path(info, afiles):
     return os.path.join(afiles, "bin", c)
 
 
-WRAP_TMPL = """#!/bin/sh
-# сгенерировано flatpak-freebsd.py: запуск через загрузчик рантайма
-exec {ld} \\
-  --library-path {libs} \\
-  {real} "$@"
-"""
+WRAP_MARK = ".wrap-v6"
+INTERP_NAME = ".ld"                  # копия загрузчика рантайма в каталоге приложения
+INTERP_PATH = b"/app/" + INTERP_NAME.encode()   # короткий путь, влезает в PT_INTERP
 
 
-WRAP_MARK = ".wrap-v3"
+def patch_interp(path):
+    """Заменить PT_INTERP (/lib64/ld-linux-...) на /app/.ld, то есть на загрузчик рантайма.
 
-
-def local_ld(ld, d):
-    """Копия загрузчика рантайма в каталоге d.
-
-    Программы вроде firefox.real ищут соседние файлы через /proc/self/exe. При запуске
-    «ld-linux программа» это путь самого загрузчика, поэтому кладём его копию (не ссылку)
-    рядом с программой: тогда /proc/self/exe указывает в её каталог."""
-    dst = os.path.join(d, ".ld.so")
+    Тогда программа запускается напрямую, и /proc/self/exe — это она сама, а не ld.so.
+    Это нужно Firefox и подобным: дочерние процессы он запускает через свой же exe.
+    Возвращает True, если файл изменён."""
     try:
-        if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(ld):
-            tmp = dst + ".tmp"
-            shutil.copyfile(ld, tmp)
-            os.chmod(tmp, 0o755)
-            os.replace(tmp, dst)
-        return dst
+        mode = os.stat(path).st_mode
+        os.chmod(path, mode | stat.S_IWUSR)
+        with open(path, "r+b") as f:
+            h = f.read(64)
+            if len(h) < 64 or h[:4] != b"\x7fELF" or h[4] != 2 or h[5] != 1:
+                return False
+            phoff = int.from_bytes(h[32:40], "little")
+            phsz = int.from_bytes(h[54:56], "little")
+            phnum = int.from_bytes(h[56:58], "little")
+            f.seek(phoff)
+            ph = f.read(phsz * phnum)
+            for i in range(phnum):
+                e = ph[i * phsz:(i + 1) * phsz]
+                if int.from_bytes(e[0:4], "little") != 3:
+                    continue
+                off = int.from_bytes(e[8:16], "little")
+                size = int.from_bytes(e[32:40], "little")
+                f.seek(off)
+                cur = f.read(size).split(b"\0")[0]
+                if cur == INTERP_PATH:
+                    return False
+                if not cur.startswith(b"/lib") or len(INTERP_PATH) + 1 > size:
+                    return False
+                f.seek(off)
+                f.write(INTERP_PATH.ljust(size, b"\0"))
+                return True
     except OSError:
-        return ld
+        pass
+    return False
 
 
-def launcher_target(p, real):
-    """Если p — крошечный запускатор вида «exec(/proc/self/exe + '-bin')» (firefox),
-    вернуть путь к настоящей программе p-bin.real, иначе real.
+def install_interp(afiles, ld):
+    """Положить загрузчик рантайма как <files>/.ld (копия: ссылка на путь в рантайме
+    не нужна, ядро берёт интерпретатор по пути /app/.ld)."""
+    dst = os.path.join(afiles, INTERP_NAME)
+    if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(ld):
+        return
+    tmp = dst + ".tmp"
+    shutil.copyfile(ld, tmp)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, dst)
 
-    Запускатор берёт путь из /proc/self/exe, а при запуске через загрузчик это путь
-    загрузчика, поэтому его проще обойти и сразу запустить p-bin."""
+
+def is_launcher_stub(p):
+    """Крошечный запускатор вида «execv(/proc/self/exe + '-bin')» (firefox)."""
     try:
-        if os.path.getsize(real) > 65536:
-            return real
-        with open(real, "rb") as f:
+        if os.path.islink(p) or os.path.getsize(p) > 65536 or not os.path.exists(p + "-bin"):
+            return False
+        with open(p, "rb") as f:
             data = f.read()
     except OSError:
-        return real
-    if b"/proc/self/exe" in data and b"-bin" in data and \
-            (os.path.exists(p + "-bin.real") or os.path.exists(p + "-bin")):
-        return p + "-bin.real"
-    return real
+        return False
+    return data[:4] == b"\x7fELF" and b"/proc/self/exe" in data and b"-bin" in data
 
 
 def wrap(info, quiet=False):
-    """Вспомогательные программы приложения (их оно зовёт по /app/...) запускаем
-    через загрузчик рантайма: системный glibc Linuxulator для них слишком старый."""
+    """Программы приложения должны работать с библиотеками рантайма: системный glibc
+    Linuxulator для них слишком старый. У каждого ELF интерпретатор заменяется на
+    загрузчик рантайма (/app/.ld); пути к библиотекам даёт LD_LIBRARY_PATH из do_run."""
     afiles, rfiles, _ = paths_for(info)
     ld = find_ld(rfiles, info["arch"])
     if ld is None:
         die("в рантайме нет загрузчика ld-linux (arch=%s)" % info["arch"])
-    libs = lib_path(afiles, rfiles, info["arch"])
-    main = os.path.realpath(command_path(info, afiles))
+    install_interp(afiles, ld)
     count = 0
+    elfs = []
     for d, dirs, files in os.walk(afiles):
         dirs[:] = [x for x in dirs if x not in ("share", "include")]
         for name in files:
-            if name.endswith(".real") or ".so" in name:
-                continue
             p = os.path.join(d, name)
-            if os.path.islink(p):
+            if name == ".ld.so":                       # остаток старой схемы
+                os.unlink(p)
                 continue
-            real = p + ".real"
-            if os.path.exists(real):
-                pass                                   # обёртка уже есть: пересоздаём пути
-            elif os.path.realpath(p) == main or not elf_interp(p):
+            if name.endswith(".real"):                 # старая схема: вернуть оригинал
+                orig = p[:-5]
+                if os.path.exists(orig) and not os.path.islink(orig):
+                    os.replace(p, orig)
                 continue
-            else:
-                os.rename(p, real)
-            tmp = p + ".tmp"
-            with open(tmp, "w") as f:
-                f.write(WRAP_TMPL.format(ld=shlex.quote(local_ld(ld, d)), libs=shlex.quote(libs),
-                                         real=shlex.quote(launcher_target(p, real))))
-            os.chmod(tmp, 0o755)
-            os.replace(tmp, p)
-            count += 1
+            if ".so" in name or os.path.islink(p) or name.startswith(".ld"):
+                continue
+            elfs.append(p)
+    for p in elfs:
+        if elf_interp(p):
+            if patch_interp(p):
+                count += 1
+    for p in elfs:                                     # запускатели -> ссылка на X-bin
+        if is_launcher_stub(p):
+            os.unlink(p)
+            os.symlink(os.path.basename(p) + "-bin", p)
     try:
         open(os.path.join(afiles, WRAP_MARK), "w").close()
     except OSError:
         pass
     if not quiet:
-        print("обёртки: %d" % count)
+        print("исправлено ELF-файлов: %d" % count)
     return count
 
 
@@ -741,8 +768,8 @@ def do_run(info, extra, isolate=False):
     if linux_loaded() is False:
         print("предупреждение: Linuxulator не загружен (service linux start)", file=sys.stderr)
     if not link_ok(afiles) and not ensure_link(afiles):
-        print("предупреждение: /app указывает не туда; приложения, зовущие /app/..., "
-              "могут не запуститься", file=sys.stderr)
+        die("ссылка %s должна указывать на %s: через неё ядро находит загрузчик рантайма"
+            % (link_path(), afiles))
 
     merged = dict(ENV_DEFAULTS)
     merged.update(read_env_file(P("env")))
@@ -767,9 +794,10 @@ def do_run(info, extra, isolate=False):
     if not env.get("DISPLAY"):
         print("предупреждение: DISPLAY не задан", file=sys.stderr)
     lp = lib_path(afiles, rfiles, arch)
+    env["LD_LIBRARY_PATH"] = lp + (":" + env["LD_LIBRARY_PATH"]
+                                   if env.get("LD_LIBRARY_PATH") else "")
     if elf_interp(cmd):
-        argv = [local_ld(ld, os.path.dirname(os.path.realpath(cmd))),
-                "--library-path", lp, cmd] + extra
+        argv = [cmd] + extra                           # PT_INTERP уже указывает на /app/.ld
     else:
         sb = shebang(cmd)
         if sb:
