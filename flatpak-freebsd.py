@@ -843,6 +843,67 @@ def do_run(info, extra, isolate=False):
         merged.setdefault("GIO_MODULE_DIR", gd)
     merged["FLATPAK_ID"] = info["id"]
     env = dict(os.environ)
+        # Ensure a usable D-Bus session bus.
+    if not env.get("DBUS_SESSION_BUS_ADDRESS"):
+            try:
+                p = subprocess.run(
+                    ["dbus-launch", "--sh-syntax"],
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+
+                if p.returncode == 0:
+                    for line in p.stdout.splitlines():
+                        line = line.strip()
+
+                        if line.startswith("DBUS_SESSION_BUS_ADDRESS="):
+                            value = line.split("=", 1)[1].strip()
+
+                            # dbus-launch outputs:
+                            # DBUS_SESSION_BUS_ADDRESS='unix:path=...';
+                            if value.endswith(";"):
+                                value = value[:-1].rstrip()
+
+                            if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+                                value = value[1:-1]
+                            elif len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+                                value = value[1:-1]
+
+                            env["DBUS_SESSION_BUS_ADDRESS"] = value
+
+                        elif line.startswith("DBUS_SESSION_BUS_PID="):
+                            value = line.split("=", 1)[1].strip()
+
+                            if value.endswith(";"):
+                                value = value[:-1].rstrip()
+
+                            if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+                                value = value[1:-1]
+                            elif len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+                                value = value[1:-1]
+
+                            env["DBUS_SESSION_BUS_PID"] = value
+
+                else:
+                    print(
+                        "предупреждение: не удалось запустить D-Bus session bus: "
+                        + p.stderr.strip(),
+                        file=sys.stderr,
+                    )
+
+            except OSError as e:
+                print(
+                    "предупреждение: dbus-launch недоступен: %s" % e,
+                    file=sys.stderr,
+                )
+            print(
+            "D-BUS ADDRESS:",
+            repr(env.get("DBUS_SESSION_BUS_ADDRESS")),
+            file=sys.stderr,
+        )
     for k, v in merged.items():
         env.setdefault(k, v)
     ours = "%s/share:%s/share" % (afiles, rfiles)
@@ -907,7 +968,7 @@ def do_run(info, extra, isolate=False):
                 argv.append(arg)
             argv += [cmd] + extra
         else:
-            argv = [cmd] + extra
+            argv = [ld, "--library-path", lp, cmd] + extra
     os.execve(argv[0], argv, env)
 
 
