@@ -754,6 +754,64 @@ def ensure_link(afiles, quiet=False):
 
     return True
 
+def ensure_flatpak_info(info, afiles, rfiles, quiet=False):
+    """Создаёт /compat/linux/.flatpak-info (его читают Steam и другие обёртки)."""
+    base = "/compat/linux" if os.path.isdir("/compat/linux") else ""
+    target = base + "/.flatpak-info"
+    rid, rarch, rbranch = split_ref(info["runtime"])
+    text = (
+        "[Application]\n"
+        "name=%(id)s\n"
+        "runtime=runtime/%(runtime)s\n"
+        "\n"
+        "[Instance]\n"
+        "instance-id=1\n"
+        "instance-path=%(var)s\n"
+        "app-path=%(afiles)s\n"
+        "runtime-path=%(rfiles)s\n"
+        "branch=%(branch)s\n"
+        "arch=%(arch)s\n"
+        "flatpak-version=1.15.0\n"
+        "\n"
+        "[Context]\n"
+        "shared=network;ipc;\n"
+        "sockets=x11;pulseaudio;\n"
+        "devices=dri;all;\n"
+        "features=devel;multiarch;bluetooth;canbus;\n"
+    ) % {
+        "id": info["id"], "runtime": info["runtime"],
+        "var": os.path.expanduser("~/.var/app/%s" % info["id"]),
+        "afiles": afiles, "rfiles": rfiles,
+        "branch": info["branch"], "arch": info["arch"],
+    }
+    try:
+        with open(target) as f:
+            if f.read() == text:
+                return True
+    except OSError:
+        pass
+    tmp = os.path.join(ROOT, "flatpak-info.tmp")
+    with open(tmp, "w") as f:
+        f.write(text)
+    if os.geteuid() == 0:
+        runner = []
+    else:
+        runner = [r for r in ("doas", "sudo") if shutil.which(r)][:1]
+        if not runner:
+            print("предупреждение: нет doas/sudo, не могу создать %s" % target,
+                  file=sys.stderr)
+            return False
+    try:
+        subprocess.run(runner + ["cp", tmp, target], check=True)
+        subprocess.run(runner + ["chmod", "644", target], check=True)
+    except (subprocess.CalledProcessError, OSError) as e:
+        print("не удалось создать %s: %s" % (target, e), file=sys.stderr)
+        return False
+    if not quiet:
+        print("создан %s" % target)
+    return True
+
+
 
 def host_timezone():
     """Имя часового пояса хоста (Area/City) или None."""
@@ -889,7 +947,7 @@ def do_run(info, extra, isolate=False):
         die("ссылка %s должна указывать на %s: через неё ядро находит загрузчик рантайма"
             % (link_path(), afiles))
     ensure_timezone()
-
+    ensure_flatpak_info(info, afiles, rfiles)
     merged = dict(ENV_DEFAULTS)
     merged.update(read_env_file(P("env")))
     merged.update(read_env_file(P("apps", info["id"], "env")))
