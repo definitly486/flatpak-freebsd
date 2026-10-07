@@ -1554,13 +1554,69 @@ def cmd_check():
 
 
 # ------------------------------------------------------------ графический режим
+def _restart_with_tkinter():
+    """Если текущий Python собран без tkinter, найти Python с tkinter и перезапустить GUI.
+
+    Это позволяет, например, запускать скрипт через системный python3.11,
+    автоматически переключившись на установленный python3.12 + py312-tkinter.
+    Версия Python не зашита в основной код GUI.
+    """
+    current = os.path.realpath(sys.executable)
+    candidates = []
+
+    # Сначала предпочитаем явно установленный Python 3.12, если он есть.
+    # Затем пробуем другие python3.X из PATH, не привязываясь к 3.11.
+    preferred = os.environ.get("FLATPAK_FB_PYTHON")
+    if preferred:
+        candidates.append(preferred)
+    candidates.append("python3.12")
+
+    path_dir = os.path.dirname(shutil.which("python3") or "/usr/local/bin/python3")
+    try:
+        names = sorted(
+            n for n in os.listdir(path_dir)
+            if re.match(r"^python3\.\d+$", n)
+        )
+        candidates.extend(names)
+    except OSError:
+        pass
+
+    seen = set()
+    for candidate in candidates:
+        exe = shutil.which(candidate) if not os.path.isabs(candidate) else candidate
+        if not exe:
+            continue
+        exe = os.path.realpath(exe)
+        if exe in seen or exe == current:
+            continue
+        seen.add(exe)
+        try:
+            check = subprocess.run(
+                [exe, "-c", "import tkinter"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if check.returncode == 0:
+            print("GUI: переключение на Python %s (tkinter доступен)" % exe)
+            os.execv(exe, [exe] + sys.argv)
+
+    return False
+
+
 def cmd_gui(a):
     try:
         import tkinter as tk
         from tkinter import ttk, messagebox, scrolledtext
     except ImportError:
-        die("для gui нужен tkinter: pkg install py%d%d-tkinter" %
-            (sys.version_info.major, sys.version_info.minor))
+        if _restart_with_tkinter():
+            return
+        die(
+            "для GUI нужен tkinter. Установите tkinter для используемого Python "
+            "(например, pkg install py312-tkinter) или задайте "
+            "FLATPAK_FB_PYTHON=/usr/local/bin/python3.12"
+        )
 
     jobs = a.jobs
     arch = host_arch()
