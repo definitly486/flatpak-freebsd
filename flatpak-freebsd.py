@@ -1310,7 +1310,7 @@ def start_dbus(env):
             env[key] = next(g for g in m.groups() if g is not None)
 
 
-def build_chroot_tree(info, root, rfiles, home, pw, var):
+def build_chroot_tree(info, root, rfiles, home, pw, var, i386=False):
     """Каталоги, ссылки и /etc корня. Всё это делается от обычного пользователя."""
     for d in ("usr", "app", "dev", "proc", "sys", "tmp", "run", "etc", "var", "home", "root"):
         os.makedirs(os.path.join(root, d), exist_ok=True)
@@ -1345,6 +1345,15 @@ def build_chroot_tree(info, root, rfiles, home, pw, var):
         gen["resolv.conf"] = resolv + "\n"
     else:
         warn("нет /etc/resolv.conf: в chroot не будет DNS")
+    tri = ARCH_INFO.get(info["arch"], ARCH_INFO["x86_64"])[0]
+    ldc = ["/app/lib", "/app/lib/" + tri]
+    if os.path.exists(os.path.join(rfiles, "etc", "ld.so.conf")):
+        ldc.append("include /usr/etc/ld.so.conf")
+    else:
+        ldc.append("/usr/lib/" + tri)
+    if i386:
+        ldc.append(I386_DIR)
+    gen["ld.so.conf"] = "\n".join(ldc) + "\n"
     tz = host_timezone()
     if tz:
         gen["timezone"] = tz + "\n"
@@ -1358,7 +1367,10 @@ def build_chroot_tree(info, root, rfiles, home, pw, var):
         _write(os.path.join(etc, name), data)
     if not os.path.exists(os.path.join(etc, "machine-id")):
         _write(os.path.join(etc, "machine-id"), os.urandom(16).hex() + "\n")
-    skip = set(gen) | {"machine-id"}
+    cache = os.path.join(etc, "ld.so.cache")
+    if os.path.islink(cache):                  # кэш свой, а не ссылка на рантайм (он только для чтения)
+        os.unlink(cache)
+    skip = set(gen) | {"machine-id", "ld.so.cache"}
     try:
         names = os.listdir(os.path.join(rfiles, "etc"))
     except OSError:
@@ -1377,6 +1389,37 @@ def build_chroot_tree(info, root, rfiles, home, pw, var):
     _link(os.path.join(var, ".var", "app", info["id"]), "../..")
 
 
+def find_ldconfig(rfiles):
+    """Путь к ldconfig внутри корня (/usr = рантайм) или None."""
+    for rel in ("sbin/ldconfig", "bin/ldconfig"):
+        if os.path.exists(os.path.join(rfiles, rel)):
+            return "/usr/" + rel
+    return None
+
+
+def refresh_ld_cache(info, root, rroot, afiles, rfiles, i386, runner, chroot_bin, pw, dry):
+    """Как Flatpak: кэш загрузчика с каталогами приложения (/app/lib). Без него
+    ctypes.util.find_library и подобные поиски не видят библиотек приложения."""
+    ldconfig = find_ldconfig(rfiles)
+    if ldconfig is None:
+        warn("в рантайме нет ldconfig: ld.so.cache не обновлён")
+        return
+    stamp = "|".join([read_text(os.path.join(os.path.dirname(afiles), ".commit")) or "0",
+                      read_text(os.path.join(os.path.dirname(rfiles), ".commit")) or "0",
+                      i386[1] if i386 else "-"])
+    sfile = os.path.join(root, "etc", ".ld-stamp")
+    if os.path.exists(os.path.join(root, "etc", "ld.so.cache")) and read_text(sfile) == stamp:
+        return
+    cmd = runner + [chroot_bin, "-u", pw.pw_name, rroot, ldconfig, "-X"]
+    if dry:
+        print("+ " + shq(cmd))
+        return
+    if subprocess.run(cmd).returncode == 0:
+        _write(sfile, stamp + "\n")
+    else:
+        warn("ldconfig завершился с ошибкой: библиотеки /app/lib найдутся только через LD_LIBRARY_PATH")
+
+
 def copy_xauthority(var):
     src = os.environ.get("XAUTHORITY") or os.path.expanduser("~/.Xauthority")
     if not os.path.isfile(src):
@@ -1389,6 +1432,14 @@ def copy_xauthority(var):
     except OSError:
         return False
     return True
+
+
+def _locale_ok(rfiles, v):
+    if v in ("", "C", "POSIX") or v.lower().replace("-", "") == "c.utf8":
+        return True
+    name, _, enc = v.partition(".")
+    cand = [v, name + "." + enc.lower().replace("-", "")] if enc else [name]
+    return any(os.path.isdir(os.path.join(rfiles, "lib", "locale", c)) for c in cand)
 
 
 def chroot_env(info, afiles, rfiles, rdir, i386, home, pw, xr, xauth):
@@ -1440,6 +1491,13 @@ def chroot_env(info, afiles, rfiles, rdir, i386, home, pw, xr, xauth):
     })
     if xauth:
         env["XAUTHORITY"] = home + "/.Xauthority"
+    # локали живут в отдельном расширении Flatpak; нет нужной - C.UTF-8 вместо предупреждения GTK
+    for k in [k for k in env if k == "LANG" or k.startswith("LC_")]:
+        if not _locale_ok(rfiles, env[k]):
+            if k == "LANG":
+                env[k] = "C.UTF-8"
+            else:
+                del env[k]
     return env
 
 
@@ -1551,7 +1609,7 @@ def do_run_chroot(info, extra, binds=(), command=None, dry=False):
 
     os.makedirs(root, exist_ok=True)
     os.makedirs(var, exist_ok=True)
-    build_chroot_tree(info, root, rfiles, home, pw, var)
+    build_chroot_tree(info, root, rfiles, home, pw, var, bool(i386))
     ensure_flatpak_info(info, "/app", "/usr",
                         [(I386_EXT, i386[1])] if i386 else [], quiet=True,
                         base=root, var="%s/.var/app/%s" % (home, info["id"]))
@@ -1585,8 +1643,22 @@ def do_run_chroot(info, extra, binds=(), command=None, dry=False):
         if not os.path.isdir(src):
             die("--bind: %s не каталог" % src)
         mounts.append(("nullfs", src, os.path.abspath(dst or src), None))
+    fdirs = []
+    for src, dst in (("/usr/local/share/fonts", "/run/host/fonts"),
+                     (os.path.expanduser("~/.local/share/fonts"), "/run/host/user-fonts"),
+                     (os.path.expanduser("~/.fonts"), "/run/host/user-fonts-legacy")):
+        if os.path.isdir(src):
+            mounts.append(("nullfs", src, dst, "ro"))
+            fdirs.append(dst)
+    os.makedirs(os.path.join(root, "run", "host"), exist_ok=True)
+    _write(os.path.join(root, "run", "host", "font-dirs.xml"),
+           '<?xml version="1.0"?>\n'
+           '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">\n<fontconfig>\n'
+           + "".join("  <dir>%s</dir>\n" % d for d in fdirs) + "</fontconfig>\n")
     chroot_mkpoints(root, mounts)
 
+    # env -i обнуляет PATH, поэтому chroot нужен по абсолютному пути
+    chroot_bin = shutil.which("chroot") or "/usr/sbin/chroot"
     env = chroot_env(info, afiles, rfiles, rdir, i386, home, pw, xr, xauth)
     start_dbus(env)
     if command:
@@ -1595,7 +1667,7 @@ def do_run_chroot(info, extra, binds=(), command=None, dry=False):
         c = info.get("command") or info["id"]
         inner = c if c.startswith("/") else "/app/bin/" + c
     argv = runner + ["env", "-i"] + ["%s=%s" % kv for kv in sorted(env.items())] \
-        + ["chroot", "-u", pw.pw_name, rroot, inner] + list(extra)
+        + [chroot_bin, "-u", pw.pw_name, rroot, inner] + list(extra)
 
     def mount_cmd(m):
         typ, src, dst, opts = m
@@ -1610,6 +1682,7 @@ def do_run_chroot(info, extra, binds=(), command=None, dry=False):
         print("# корень: %s" % rroot)
         if todo:
             print("+ " + shq(runner + ["sh", "-c", mount_script]))
+        refresh_ld_cache(info, root, rroot, afiles, rfiles, i386, runner, chroot_bin, pw, True)
         print("+ " + shq(argv))
         print("# после выхода (если других экземпляров нет):")
         for p in sorted((rroot + m[2] for m in mounts), key=len, reverse=True):
@@ -1628,6 +1701,7 @@ def do_run_chroot(info, extra, binds=(), command=None, dry=False):
                     subprocess.run(runner + ["kldload", m], stderr=subprocess.DEVNULL)
             if subprocess.run(runner + ["sh", "-c", mount_script]).returncode != 0:
                 die("не удалось смонтировать корень %s (см. сообщения выше)" % rroot)
+        refresh_ld_cache(info, root, rroot, afiles, rfiles, i386, runner, chroot_bin, pw, False)
         proc = subprocess.Popen(argv)
         while True:
             try:
