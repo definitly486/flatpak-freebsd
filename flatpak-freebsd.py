@@ -1865,7 +1865,9 @@ def main():
     ap.add_argument("--root", default=os.environ.get(
         "FLATPAK_FB_ROOT", os.path.expanduser("~/.local/share/flatpak-freebsd")))
     ap.add_argument("-j", "--jobs", type=int, default=16)
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.add_argument("-g", "--gui", action="store_true",
+                    help="запустить графический интерфейс Tkinter")
+    sub = ap.add_subparsers(dest="cmd", required=False)
 
     def add_install_opts(p):
         p.add_argument("target")
@@ -1914,7 +1916,15 @@ def main():
     p.add_argument("--branch")
     p.add_argument("--prune", action="store_true")
 
+    # -g/--gui запускает GUI без обязательной подкоманды.
+    # Обычный запуск без аргументов по-прежнему показывает help.
     a = ap.parse_args()
+    if a.gui:
+        a.cmd = "gui"
+    elif a.cmd is None:
+        ap.print_help()
+        return
+
     ROOT = os.path.abspath(a.root)
     os.makedirs(ROOT, exist_ok=True)
     extra = [x for x in getattr(a, "rest", []) if x != "--"]
