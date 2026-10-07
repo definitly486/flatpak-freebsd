@@ -6,4 +6,4 @@ git config --global user.name "Your Name"
 git add --all
 git add .
 git commit -n
-git push git@github.com:definitly486/App_Blackview.git
+git push git@github.com:definitly486/flatpak-freebsd.git
