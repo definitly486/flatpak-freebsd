@@ -1231,6 +1231,26 @@ CHROOT_MODS = ("nullfs", "tmpfs", "fdescfs", "linprocfs", "linsysfs")
 I386_DIR = "/usr/lib/i386-linux-gnu"
 
 
+SPAWN_SHIM = """#!/bin/sh
+# flatpak-spawn без портала: на FreeBSD сервиса org.freedesktop.portal.Flatpak нет,
+# поэтому команда просто выполняется здесь же, внутри chroot (--host тоже).
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        --env=*) export "${1#--env=}" ;;
+        --unset-env=*) unset "${1#--unset-env=}" ;;
+        --directory=*) cd "${1#--directory=}" || exit 1 ;;
+        -*) ;;
+        *) break ;;
+    esac
+    shift
+done
+[ $# -gt 0 ] || exit 0
+exec "$@"
+"""
+SHIM_DIR = "/opt/flatpak-fb/bin"
+
+
 def root_runner():
     """Префикс для команд от root: [] если мы root, ['doas'|'sudo'], None если нечем."""
     if os.geteuid() == 0:
@@ -1323,6 +1343,9 @@ def build_chroot_tree(info, root, rfiles, home, pw, var, i386=False):
             continue
         _link(os.path.join(root, name), "usr/" + name)
     _link(os.path.join(root, "var", "run"), "../run")
+    shim_dir = root + SHIM_DIR
+    os.makedirs(shim_dir, exist_ok=True)
+    _write(os.path.join(shim_dir, "flatpak-spawn"), SPAWN_SHIM, 0o755)
 
     # /etc: сгенерированные файлы + ссылки на usr/etc рантайма (как у Flatpak)
     try:
@@ -1476,6 +1499,7 @@ def chroot_env(info, afiles, rfiles, rdir, i386, home, pw, xr, xauth):
     if layer.get("LD_LIBRARY_PATH"):
         lp += ":" + layer["LD_LIBRARY_PATH"]
     env["LD_LIBRARY_PATH"] = lp
+    env["PATH"] = SHIM_DIR + ":" + env["PATH"]    # flatpak-spawn-шим первым (портала нет)
     gi = ["/app/lib/%s/girepository-1.0" % tri, "/usr/lib/%s/girepository-1.0" % tri,
           "/app/lib/girepository-1.0", "/usr/lib/girepository-1.0"]
     if env.get("GI_TYPELIB_PATH"):
