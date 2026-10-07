@@ -860,6 +860,32 @@ def do_run(info, extra, isolate=False):
     lp = lib_path(afiles, rfiles, arch)
     env["LD_LIBRARY_PATH"] = lp + (":" + env["LD_LIBRARY_PATH"]
                                    if env.get("LD_LIBRARY_PATH") else "")
+        # GObject Introspection (.typelib)
+    gi_paths = [
+        os.path.join(
+            afiles,
+            "lib",
+            ARCH_INFO.get(arch, ARCH_INFO["x86_64"])[0],
+            "girepository-1.0",
+        ),
+        os.path.join(
+            rfiles,
+            "lib",
+            ARCH_INFO.get(arch, ARCH_INFO["x86_64"])[0],
+            "girepository-1.0",
+        ),
+        os.path.join(afiles, "lib", "girepository-1.0"),
+        os.path.join(rfiles, "lib", "girepository-1.0"),
+    ]
+
+    gi_paths = [p for p in gi_paths if os.path.isdir(p)]
+
+    old_gi = env.get("GI_TYPELIB_PATH")
+    if old_gi:
+        gi_paths.append(old_gi)
+
+    if gi_paths:
+        env["GI_TYPELIB_PATH"] = ":".join(gi_paths)
     if elf_interp(cmd):
         argv = [cmd] + extra                           # PT_INTERP уже указывает на /app/.ld
     else:
