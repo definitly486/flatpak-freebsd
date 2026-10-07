@@ -676,19 +676,83 @@ def link_ok(afiles):
 
 def ensure_link(afiles, quiet=False):
     link = link_path()
+
     if link_ok(afiles):
         return True
-    try:
-        if os.path.islink(link):
-            os.unlink(link)
-        os.symlink(afiles, link)
-        print("создана ссылка %s -> %s" % (link, afiles))
-        return True
-    except OSError:
+
+    # Если мы root — создаём ссылку напрямую.
+    if os.geteuid() == 0:
+        try:
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.symlink(afiles, link)
+            if not quiet:
+                print("создана ссылка %s -> %s" % (link, afiles))
+            return True
+        except OSError as e:
+            if not quiet:
+                print("не удалось создать ссылку %s: %s" % (link, e),
+                      file=sys.stderr)
+            return False
+
+    # Обычный пользователь: автоматически используем doas или sudo.
+    runner = None
+
+    if shutil.which("doas"):
+        runner = "doas"
+    elif shutil.which("sudo"):
+        runner = "sudo"
+
+    if runner is None:
         if not quiet:
-            print("\nМногие приложения зовут свои программы по пути /app. Выполните от root:")
-            print("  sudo ln -sfn %s %s\n" % (shlex.quote(afiles), link))
+            print(
+                "\nДля запуска приложения требуется root-доступ, "
+                "чтобы настроить %s." % link,
+                file=sys.stderr
+            )
+            print(
+                "Установите/настройте doas или sudo, либо запустите "
+                "скрипт от root.",
+                file=sys.stderr
+            )
         return False
+
+    try:
+        subprocess.run(
+            [
+                runner,
+                "ln",
+                "-sfn",
+                afiles,
+                link,
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        if not quiet:
+            print(
+                "\nНе удалось настроить %s для приложения." % link,
+                file=sys.stderr
+            )
+        return False
+    except OSError as e:
+        if not quiet:
+            print("ошибка запуска %s: %s" % (runner, e),
+                  file=sys.stderr)
+        return False
+
+    if not link_ok(afiles):
+        if not quiet:
+            print(
+                "ссылка %s не указывает на %s" % (link, afiles),
+                file=sys.stderr
+            )
+        return False
+
+    if not quiet:
+        print("ссылка %s -> %s" % (link, afiles))
+
+    return True
 
 
 # ------------------------------------------------------------ запуск
