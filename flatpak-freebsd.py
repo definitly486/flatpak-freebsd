@@ -15,12 +15,8 @@ flatpak-freebsd: скачивание и запуск Flatpak-приложени
   remove ID        удалить (--prune: заодно неиспользуемые рантаймы)
   link ID          ссылка /app -> файлы приложения (нужен root, один раз)
   wrap ID          пересоздать обёртки для вспомогательных процессов
+  umount ID        размонтировать chroot приложения (после аварийного завершения)
   check            диагностика окружения
-
-Опции run/start:
-  --isolate        данные приложения в ~/.var/app/ID, как во Flatpak
-  --chroot         запустить в chroot (/compat/linux); нужен root, doas или sudo.
-                   Данные приложения при этом тоже в ~/.var/app/ID
 
 ЦЕЛЬ: ID приложения (org.mozilla.firefox), либо путь/URL к .flatpakref.
 Репозиторий задаётся --remote: flathub (по умолчанию), flathub-beta,
@@ -31,10 +27,13 @@ URL .flatpakrepo или URL самого репозитория.
   flatpak-freebsd.py start com.kagi.Orion --branch beta \\
       --remote https://flatpak.orionbrowser.com/orion-beta.flatpakrepo
   flatpak-freebsd.py run org.gnome.Calculator
-  flatpak-freebsd.py run org.gnome.Calculator --chroot
   flatpak-freebsd.py update
   flatpak-freebsd.py search текстовый редактор
   flatpak-freebsd.py search -i org.gnome.Calculator
+
+Режим --chroot (run/start): приложение запускается в корне, собранном как в Flatpak
+(/usr = рантайм, /app = приложение), без подмены загрузчиков и ссылки в /compat/linux.
+Нужен root для mount/chroot (doas или sudo). Проверка без root: --dry-run.
 
 Данные: ~/.local/share/flatpak-freebsd (или --root / $FLATPAK_FB_ROOT).
 Настройки окружения: файл ROOT/env (для всех) и ROOT/apps/ID/env (для одного),
@@ -44,6 +43,7 @@ import argparse
 import hashlib
 import io
 import json
+import grp
 import os
 import pwd
 import re
@@ -53,6 +53,7 @@ import stat
 import subprocess
 import sys
 import textwrap
+import tempfile
 import threading
 import time
 import urllib.error
@@ -671,6 +672,38 @@ def wrap(info, quiet=False):
     return count
 
 
+RT_MARK = ".wrap-rt-v1"
+
+
+def wrap_runtime(rdir, rfiles, quiet=False):
+    """То же, что wrap(), но для исполняемых файлов рантайма (zenity, bash, ...).
+
+    Дочерние процессы, которые приложение запускает из рантайма, иначе получают
+    старый загрузчик из /compat/linux вместе с новым glibc рантайма
+    (ошибка вида: undefined symbol __pointer_chk_guard, version GLIBC_PRIVATE)."""
+    mark = os.path.join(rdir, RT_MARK)
+    if os.path.exists(mark):
+        return 0
+    count = 0
+    for d, dirs, files in os.walk(rfiles):
+        dirs[:] = [x for x in dirs if x not in ("share", "include")]
+        for name in files:
+            if ".so" in name:
+                continue
+            p = os.path.join(d, name)
+            if os.path.islink(p):
+                continue
+            if elf_interp(p) and patch_interp(p):
+                count += 1
+    try:
+        open(mark, "w").close()
+    except OSError:
+        pass
+    if not quiet:
+        print("рантайм: исправлено ELF-файлов: %d" % count)
+    return count
+
+
 # ------------------------------------------------------------ ссылка /app
 def link_path():
     return "/compat/linux/app" if os.path.isdir("/compat/linux") else "/app"
@@ -761,64 +794,6 @@ def ensure_link(afiles, quiet=False):
 
     return True
 
-def ensure_flatpak_info(info, afiles, rfiles, quiet=False):
-    """Создаёт /compat/linux/.flatpak-info (его читают Steam и другие обёртки)."""
-    base = "/compat/linux" if os.path.isdir("/compat/linux") else ""
-    target = base + "/.flatpak-info"
-    rid, rarch, rbranch = split_ref(info["runtime"])
-    text = (
-        "[Application]\n"
-        "name=%(id)s\n"
-        "runtime=runtime/%(runtime)s\n"
-        "\n"
-        "[Instance]\n"
-        "instance-id=1\n"
-        "instance-path=%(var)s\n"
-        "app-path=%(afiles)s\n"
-        "runtime-path=%(rfiles)s\n"
-        "branch=%(branch)s\n"
-        "arch=%(arch)s\n"
-        "flatpak-version=1.15.0\n"
-        "\n"
-        "[Context]\n"
-        "shared=network;ipc;\n"
-        "sockets=x11;pulseaudio;\n"
-        "devices=dri;all;\n"
-        "features=devel;multiarch;bluetooth;canbus;\n"
-    ) % {
-        "id": info["id"], "runtime": info["runtime"],
-        "var": os.path.expanduser("~/.var/app/%s" % info["id"]),
-        "afiles": afiles, "rfiles": rfiles,
-        "branch": info["branch"], "arch": info["arch"],
-    }
-    try:
-        with open(target) as f:
-            if f.read() == text:
-                return True
-    except OSError:
-        pass
-    tmp = os.path.join(ROOT, "flatpak-info.tmp")
-    with open(tmp, "w") as f:
-        f.write(text)
-    if os.geteuid() == 0:
-        runner = []
-    else:
-        runner = [r for r in ("doas", "sudo") if shutil.which(r)][:1]
-        if not runner:
-            print("предупреждение: нет doas/sudo, не могу создать %s" % target,
-                  file=sys.stderr)
-            return False
-    try:
-        subprocess.run(runner + ["cp", tmp, target], check=True)
-        subprocess.run(runner + ["chmod", "644", target], check=True)
-    except (subprocess.CalledProcessError, OSError) as e:
-        print("не удалось создать %s: %s" % (target, e), file=sys.stderr)
-        return False
-    if not quiet:
-        print("создан %s" % target)
-    return True
-
-
 
 def host_timezone():
     """Имя часового пояса хоста (Area/City) или None."""
@@ -872,6 +847,138 @@ def ensure_timezone(quiet=False):
     except (subprocess.CalledProcessError, OSError) as e:
         if not quiet:
             print("не удалось создать %s: %s" % (target, e), file=sys.stderr)
+
+
+# ------------------------------------------- .flatpak-info и 32-битные расширения
+I386_EXT = "org.freedesktop.Platform.Compat.i386"
+
+
+def root_run(*cmd):
+    """Выполнить команду от root (напрямую, через doas или через sudo)."""
+    if os.geteuid() == 0:
+        runner = []
+    else:
+        runner = [r for r in ("doas", "sudo") if shutil.which(r)][:1]
+        if not runner:
+            print("предупреждение: нет doas/sudo, не могу выполнить: %s" % " ".join(cmd),
+                  file=sys.stderr)
+            return False
+    try:
+        subprocess.run(runner + list(cmd), check=True)
+        return True
+    except (subprocess.CalledProcessError, OSError) as e:
+        print("не удалось выполнить %s: %s" % (" ".join(cmd), e), file=sys.stderr)
+        return False
+
+
+def ensure_flatpak_info(info, afiles, rfiles, exts=(), quiet=False, base=None, var=None):
+    """Создаёт /compat/linux/.flatpak-info (его читают Steam и другие обёртки).
+
+    Файл один на всю систему, поэтому при запуске другого приложения он
+    перезаписывается."""
+    direct = base is not None            # свой корень (chroot): пишем без root
+    if base is None:
+        base = "/compat/linux" if os.path.isdir("/compat/linux") else ""
+    target = base + "/.flatpak-info"
+    text = (
+        "[Application]\n"
+        "name=%(id)s\n"
+        "runtime=runtime/%(runtime)s\n"
+        "\n"
+        "[Instance]\n"
+        "instance-id=1\n"
+        "instance-path=%(var)s\n"
+        "app-path=%(afiles)s\n"
+        "runtime-path=%(rfiles)s\n"
+        "branch=%(branch)s\n"
+        "arch=%(arch)s\n"
+        "flatpak-version=1.15.0\n"
+        "runtime-extensions=%(rext)s\n"
+        "app-extensions=\n"
+        "\n"
+        "[Context]\n"
+        "shared=network;ipc;\n"
+        "sockets=x11;pulseaudio;\n"
+        "devices=dri;all;\n"
+        "features=devel;multiarch;bluetooth;canbus;\n"
+    ) % {
+        "id": info["id"], "runtime": info["runtime"],
+        "var": var or os.path.expanduser("~/.var/app/%s" % info["id"]),
+        "afiles": afiles, "rfiles": rfiles,
+        "branch": info["branch"], "arch": info["arch"],
+        "rext": "".join("%s=%s;" % e for e in exts),
+    }
+    if read_text(target) == text:
+        return True
+    if direct:
+        with open(target, "w") as f:
+            f.write(text)
+        os.chmod(target, 0o644)
+        return True
+    fd, tmp = tempfile.mkstemp(prefix="flatpak-info-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        ok = root_run("cp", tmp, target) and root_run("chmod", "644", target)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if ok and not quiet:
+        print("создан %s" % target)
+    return ok
+
+
+def wants_i386(info, afiles):
+    """Приложению нужны 32-битные библиотеки (features=multiarch в metadata)."""
+    if info["arch"] != "x86_64":
+        return False
+    meta = read_text(os.path.join(os.path.dirname(afiles), "metadata")) or ""
+    return "multiarch" in meta
+
+
+def ensure_i386(info, jobs=4, patch_base=True):
+    """Скачивает Compat.i386 и подменяет 32-битный загрузчик Linuxulator.
+    Возвращает (каталог_с_библиотеками, коммит) или None."""
+    import glob
+    rid, rarch, rbranch = split_ref(info["runtime"])
+    edir = runtime_dir(I386_EXT, rarch, rbranch)
+    ref = "runtime/%s/%s/%s" % (I386_EXT, rarch, rbranch)
+    efiles = os.path.join(edir, "files")
+    if not os.path.isdir(efiles):
+        print("скачиваю 32-битное расширение %s (может занять время)" % I386_EXT)
+        for spec in (info.get("runtime_remote"), info.get("remote"), DEFAULT_REMOTE):
+            if not spec:
+                continue
+            repo = Repo(resolve_remote(spec), jobs)
+            if repo.head_opt(ref) is not None:
+                sync(repo, ref, edir, "расширение " + I386_EXT)
+                break
+        else:
+            print("предупреждение: %s не найден ни в одном репозитории" % ref,
+                  file=sys.stderr)
+            return None
+    commit = read_text(os.path.join(edir, ".commit")) or "0"
+
+    # 32-битные программы просят /lib/ld-linux.so.2: подменяем его загрузчиком
+    # расширения (иначе берётся старый из Linuxulator -> ошибка GLIBC_PRIVATE)
+    found = glob.glob(os.path.join(efiles, "**", "ld-linux.so.2"), recursive=True)
+    if not found:
+        print("предупреждение: в %s нет ld-linux.so.2" % efiles, file=sys.stderr)
+    elif patch_base:
+        ld32 = os.path.realpath(found[0])
+        link_dir = "/compat/linux/lib" if os.path.isdir("/compat/linux") else "/lib"
+        target = link_dir + "/ld-linux.so.2"
+        if os.path.lexists(target) and not os.path.islink(target):
+            print("предупреждение: %s - обычный файл, не трогаю" % target,
+                  file=sys.stderr)
+        elif os.path.realpath(target) != ld32:
+            if os.path.islink(target):
+                print("замена ссылки %s (было -> %s)" % (target, os.readlink(target)),
+                      file=sys.stderr)
+            root_run("ln", "-sfn", ld32, target)
+    return efiles, commit
 
 
 # ------------------------------------------------------------ запуск
@@ -939,113 +1046,7 @@ def resolve_interp(interp, afiles, rfiles):
     return None
 
 
-# ------------------------------------------------------------ chroot
-CHROOT_ROOT = "/compat/linux"
-
-
-def priv_runner():
-    """Команда повышения прав: [] для root, иначе ['doas'] или ['sudo']."""
-    if os.geteuid() == 0:
-        return []
-    r = [x for x in ("doas", "sudo") if shutil.which(x)][:1]
-    if not r:
-        die("для --chroot нужен root, doas или sudo")
-    return r
-
-
-def mounted_points():
-    """Множество реальных путей, где что-то смонтировано."""
-    try:
-        out = subprocess.run(["mount", "-p"], stdout=subprocess.PIPE, text=True,
-                             check=True).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return set()
-    pts = set()
-    for line in out.splitlines():
-        f = line.split()
-        if len(f) >= 2:
-            pts.add(os.path.realpath(f[1]))
-    return pts
-
-
-def chroot_path(p):
-    """Путь хоста -> путь внутри chroot (/compat/linux/bin/sh -> /bin/sh)."""
-    pre = CHROOT_ROOT + "/"
-    return p[len(CHROOT_ROOT):] if p.startswith(pre) else p
-
-
-def same_dir(a, b):
-    """True, если a и b — один и тот же каталог (по inode), в том числе через nullfs."""
-    try:
-        return os.stat(a).st_ino == os.stat(b).st_ino
-    except OSError:
-        return False
-
-
-def chroot_prepare(root, var):
-    """Смонтировать всё нужное внутри root. Возвращает список наших точек монтирования."""
-    # (тип, источник, точка, опции, обязательно)
-    plan = [
-        ("devfs", "devfs", root + "/dev", None, False),
-        ("tmpfs", "tmpfs", root + "/dev/shm", "mode=1777", False),
-        ("fdescfs", "fdescfs", root + "/dev/fd", "linrdlnk", False),
-        ("linprocfs", "linprocfs", root + "/proc", None, False),
-        ("linsysfs", "linsysfs", root + "/sys", None, False),
-        ("nullfs", "/tmp", root + "/tmp", None, True),            # сокеты X11 и D-Bus
-        ("nullfs", ROOT, root + ROOT, "ro", True),                # приложение и рантайм
-        ("nullfs", var, root + var, None, True),                  # данные приложения
-    ]
-    run = priv_runner()
-    pts = mounted_points()
-    done = []
-    for typ, src, dst, opts, need in plan:
-        if os.path.realpath(dst) in pts:
-            continue
-        if not os.path.isdir(dst):
-            subprocess.run(run + ["mkdir", "-p", dst])
-        if typ == "nullfs" and same_dir(src, dst):
-            continue                                   # уже виден по этому пути (например, /home)
-        cmd = run + ["mount", "-t", typ] + (["-o", opts] if opts else []) + [src, dst]
-        if subprocess.run(cmd).returncode == 0:
-            done.append(dst)
-        elif need:
-            chroot_cleanup(done)
-            die("не удалось смонтировать %s в %s" % (src, dst))
-        else:
-            warn("не удалось смонтировать %s в %s" % (typ, dst))
-    return done
-
-
-def chroot_cleanup(done):
-    run = priv_runner()
-    for dst in reversed(done):
-        r = subprocess.run(run + ["umount", dst], stderr=subprocess.PIPE, text=True)
-        if r.returncode != 0:
-            warn("не удалось отмонтировать %s: %s" % (dst, r.stderr.strip()))
-
-
-def run_chroot(argv, env, var):
-    """Запустить argv в chroot CHROOT_ROOT, после выхода отмонтировать за собой."""
-    root = CHROOT_ROOT
-    if not os.path.isdir(root):
-        die("для --chroot нужен каталог %s (Linuxulator)" % root)
-    done = chroot_prepare(root, var)
-    # абсолютные пути: PATH приложения начинается с bin рантайма, где свой (GNU) chroot
-    cmd = (priv_runner() + ["/usr/bin/env", "-i"] + ["%s=%s" % kv for kv in env.items()]
-           + ["/usr/sbin/chroot"])
-    if os.geteuid() != 0:                      # chroot делает root, дальше сбрасываем права
-        cmd += ["-u", pwd.getpwuid(os.geteuid()).pw_name, "-g", str(os.getgid())]
-        groups = [str(g) for g in os.getgroups()]
-        if groups:
-            cmd += ["-G", ",".join(groups)]
-    cmd += [root] + argv
-    try:
-        return subprocess.run(cmd).returncode
-    finally:
-        chroot_cleanup(done)
-
-
-def do_run(info, extra, isolate=False, chroot=False):
+def do_run(info, extra, isolate=False):
     afiles, rfiles, rdir = paths_for(info)
     arch = info["arch"]
     ld = find_ld(rfiles, arch)
@@ -1054,13 +1055,18 @@ def do_run(info, extra, isolate=False, chroot=False):
         die("приложение не готово. Выполните: install %s" % info["id"])
     if not os.path.exists(os.path.join(afiles, WRAP_MARK)):
         wrap(info, quiet=True)                         # обновить обёртки до новой схемы
+    install_interp(afiles, ld)                         # /app/.ld нужен и бинарникам рантайма
+    wrap_runtime(rdir, rfiles)
     if linux_loaded() is False:
         print("предупреждение: Linuxulator не загружен (service linux start)", file=sys.stderr)
     if not link_ok(afiles) and not ensure_link(afiles):
         die("ссылка %s должна указывать на %s: через неё ядро находит загрузчик рантайма"
             % (link_path(), afiles))
     ensure_timezone()
-    ensure_flatpak_info(info, afiles, rfiles)
+    i386 = ensure_i386(info) if wants_i386(info, afiles) else None
+    ensure_flatpak_info(info, afiles, rfiles,
+                        [(I386_EXT, i386[1])] if i386 else [])
+
     merged = dict(ENV_DEFAULTS)
     merged.update(read_env_file(P("env")))
     merged.update(read_env_file(P("apps", info["id"], "env")))
@@ -1136,23 +1142,31 @@ def do_run(info, extra, isolate=False, chroot=False):
     env["XDG_DATA_DIRS"] = ours + (":" + env["XDG_DATA_DIRS"] if env.get("XDG_DATA_DIRS") else "")
     env["PATH"] = ":".join([os.path.join(afiles, "bin"), os.path.join(rfiles, "bin"),
                             env.get("PATH", "/usr/bin:/bin")])
-    if isolate or chroot:
+    if isolate:
         var = os.path.expanduser("~/.var/app/%s" % info["id"])
         for k, sub in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
                        ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")):
             os.makedirs(os.path.join(var, sub), exist_ok=True)
             env[k] = os.path.join(var, sub)
-    if chroot:
-        env["HOME"] = var                              # настоящего домашнего каталога в chroot нет
-        xa = env.get("XAUTHORITY") or os.path.expanduser("~/.Xauthority")
-        if os.path.isfile(xa):                         # cookie X11 должен быть виден внутри chroot
-            xdst = os.path.join(var, ".Xauthority")
-            shutil.copyfile(xa, xdst)
-            os.chmod(xdst, 0o600)
-            env["XAUTHORITY"] = xdst
+    else:
+        # как в настоящем Flatpak, эти переменные заданы всегда (Steam читает их без .get)
+        home = os.path.expanduser("~")
+        for k, v in (("XDG_CONFIG_HOME", os.path.join(home, ".config")),
+                     ("XDG_DATA_HOME", os.path.join(home, ".local", "share")),
+                     ("XDG_CACHE_HOME", os.path.join(home, ".cache")),
+                     ("XDG_STATE_HOME", os.path.join(home, ".local", "state"))):
+            if not env.get(k):
+                os.makedirs(v, exist_ok=True)
+                env[k] = v
+    if not env.get("XDG_RUNTIME_DIR"):                 # на FreeBSD обычно не задан
+        rt = "/tmp/xdg-runtime-%d" % os.getuid()
+        os.makedirs(rt, mode=0o700, exist_ok=True)
+        env["XDG_RUNTIME_DIR"] = rt
     if not env.get("DISPLAY"):
         print("предупреждение: DISPLAY не задан", file=sys.stderr)
     lp = lib_path(afiles, rfiles, arch)
+    if i386:
+        lp += ":" + i386[0]     # 64-битные процессы пропустят ELF другого класса
     env["LD_LIBRARY_PATH"] = lp + (":" + env["LD_LIBRARY_PATH"]
                                    if env.get("LD_LIBRARY_PATH") else "")
         # GObject Introspection (.typelib)
@@ -1203,11 +1217,432 @@ def do_run(info, extra, isolate=False, chroot=False):
             argv += [cmd] + extra
         else:
             argv = [ld, "--library-path", lp, cmd] + extra
-    if chroot:
-        n = len(argv) - len(extra)                     # аргументы пользователя не трогаем
-        argv = [chroot_path(x) for x in argv[:n]] + argv[n:]
-        sys.exit(run_chroot(argv, env, var))
     os.execve(argv[0], argv, env)
+
+
+# ------------------------------------------------------------------ chroot
+# Режим --chroot повторяет раскладку настоящего Flatpak: /usr - это рантайм,
+# /app - приложение, /lib64 -> usr/lib64. Загрузчик и библиотеки всегда из одного
+# рантайма, поэтому подмена PT_INTERP, хитрости с LD_LIBRARY_PATH и ссылка
+# /compat/linux/app не нужны: и /bin/sh, и env, и rm внутри - те же, что в рантайме.
+# Корень лежит в ROOT/chroot/ID. От root выполняются только mount, chroot и umount
+# (через doas/sudo), всё остальное - от пользователя.
+CHROOT_MODS = ("nullfs", "tmpfs", "fdescfs", "linprocfs", "linsysfs")
+I386_DIR = "/usr/lib/i386-linux-gnu"
+
+
+def root_runner():
+    """Префикс для команд от root: [] если мы root, ['doas'|'sudo'], None если нечем."""
+    if os.geteuid() == 0:
+        return []
+    r = [x for x in ("doas", "sudo") if shutil.which(x)][:1]
+    return r or None
+
+
+def chroot_dir(appid):
+    return P("chroot", appid)
+
+
+def _link(path, target):
+    """Симлинк path -> target. Чужую ссылку заменяет, обычные файлы не трогает."""
+    if os.path.islink(path):
+        if os.readlink(path) == target:
+            return
+        os.unlink(path)
+    elif os.path.lexists(path):
+        warn("%s - не ссылка, не трогаю" % path)
+        return
+    os.symlink(target, path)
+
+
+def _write(path, data, mode=0o644):
+    if isinstance(data, str):
+        data = data.encode()
+    try:
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return
+    except OSError:
+        pass
+    if os.path.islink(path):
+        os.unlink(path)
+    with open(path, "wb") as f:
+        f.write(data)
+    os.chmod(path, mode)
+
+
+def meta_env(path):
+    """Секция [Environment] файла metadata: Flatpak передаёт её приложению как есть."""
+    return parse_ini(read_text(path) or "").get("Environment", {})
+
+
+def start_dbus(env):
+    """Если сессионной шины нет - запустить dbus-launch (как это делает do_run)."""
+    if env.get("DBUS_SESSION_BUS_ADDRESS"):
+        return
+    try:
+        p = subprocess.run(["dbus-launch", "--sh-syntax"], env=env, text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as e:
+        warn("dbus-launch недоступен: %s" % e)
+        return
+    if p.returncode != 0:
+        warn("не удалось запустить D-Bus session bus: " + p.stderr.strip())
+        return
+    for key in ("DBUS_SESSION_BUS_ADDRESS", "DBUS_SESSION_BUS_PID"):
+        m = re.search(key + r"""=(?:'([^']*)'|"([^"]*)"|([^;\s]+))""", p.stdout)
+        if m:
+            env[key] = next(g for g in m.groups() if g is not None)
+
+
+def build_chroot_tree(info, root, rfiles, home, pw, var):
+    """Каталоги, ссылки и /etc корня. Всё это делается от обычного пользователя."""
+    for d in ("usr", "app", "dev", "proc", "sys", "tmp", "run", "etc", "var", "home", "root"):
+        os.makedirs(os.path.join(root, d), exist_ok=True)
+    for d in ("tmp", "cache", "log", "lib"):
+        p = os.path.join(root, "var", d)
+        os.makedirs(p, exist_ok=True)
+        os.chmod(p, 0o1777)
+    for name in ("bin", "sbin", "lib", "lib64", "lib32"):
+        if name == "lib32" and not os.path.exists(os.path.join(rfiles, "lib32")):
+            continue
+        _link(os.path.join(root, name), "usr/" + name)
+    _link(os.path.join(root, "var", "run"), "../run")
+
+    # /etc: сгенерированные файлы + ссылки на usr/etc рантайма (как у Flatpak)
+    try:
+        gname = grp.getgrgid(pw.pw_gid).gr_name
+    except KeyError:
+        gname = pw.pw_name
+    gen = {
+        "passwd": "root:x:0:0:root:/root:/bin/sh\n"
+                  "%s:x:%d:%d:%s:%s:/bin/sh\n"
+                  "nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n"
+                  % (pw.pw_name, pw.pw_uid, pw.pw_gid,
+                     pw.pw_gecos.split(",")[0].replace(":", " "), home),
+        "group": "root:x:0:\n%s:x:%d:\nnogroup:x:65534:\n" % (gname, pw.pw_gid),
+        "hostname": os.uname().nodename + "\n",
+    }
+    hosts = read_text("/etc/hosts")
+    gen["hosts"] = (hosts + "\n") if hosts else "127.0.0.1 localhost\n::1 localhost\n"
+    resolv = read_text("/etc/resolv.conf")
+    if resolv:
+        gen["resolv.conf"] = resolv + "\n"
+    else:
+        warn("нет /etc/resolv.conf: в chroot не будет DNS")
+    tz = host_timezone()
+    if tz:
+        gen["timezone"] = tz + "\n"
+    try:
+        with open("/etc/localtime", "rb") as f:
+            gen["localtime"] = f.read()
+    except OSError:
+        pass
+    etc = os.path.join(root, "etc")
+    for name, data in gen.items():
+        _write(os.path.join(etc, name), data)
+    if not os.path.exists(os.path.join(etc, "machine-id")):
+        _write(os.path.join(etc, "machine-id"), os.urandom(16).hex() + "\n")
+    skip = set(gen) | {"machine-id"}
+    try:
+        names = os.listdir(os.path.join(rfiles, "etc"))
+    except OSError:
+        names = []
+    for n in names:
+        if n not in skip:
+            _link(os.path.join(etc, n), "../usr/etc/" + n)
+
+    # ~ внутри песочницы и ~/.var/app/ID - один и тот же каталог (--persist=. у Flatpak)
+    for sub in ("config", "data", "cache", ".local/state"):
+        try:
+            os.makedirs(os.path.join(var, sub), exist_ok=True)
+        except OSError:
+            pass
+    os.makedirs(os.path.join(var, ".var", "app"), exist_ok=True)
+    _link(os.path.join(var, ".var", "app", info["id"]), "../..")
+
+
+def copy_xauthority(var):
+    src = os.environ.get("XAUTHORITY") or os.path.expanduser("~/.Xauthority")
+    if not os.path.isfile(src):
+        return False
+    dst = os.path.join(var, ".Xauthority")
+    try:
+        if os.path.abspath(src) != os.path.abspath(dst):
+            shutil.copyfile(src, dst)
+        os.chmod(dst, 0o600)
+    except OSError:
+        return False
+    return True
+
+
+def chroot_env(info, afiles, rfiles, rdir, i386, home, pw, xr, xauth):
+    arch = info["arch"]
+    tri = ARCH_INFO.get(arch, ARCH_INFO["x86_64"])[0]
+    var = "%s/.var/app/%s" % (home, info["id"])
+    # как и Flatpak, не тащим в песочницу всё окружение хозяина (SSL_CERT_FILE и т. п.)
+    keep = ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "DBUS_SESSION_BUS_PID",
+            "PULSE_SERVER", "PULSE_COOKIE", "TERM", "COLORTERM", "LANG", "LANGUAGE", "TZ",
+            "XDG_SESSION_TYPE", "http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY",
+            "HTTPS_PROXY", "NO_PROXY")
+    host = {k: v for k, v in os.environ.items()
+            if k in keep or k.startswith("LC_")
+            or (k.startswith("FLATPAK_") and not k.startswith("FLATPAK_FB_"))}
+    layer = dict(meta_env(os.path.join(rdir, "metadata")))
+    layer.update(meta_env(os.path.join(os.path.dirname(afiles), "metadata")))
+    layer.update(ENV_DEFAULTS)
+    layer.update(read_env_file(P("env")))
+    layer.update(read_env_file(P("apps", info["id"], "env")))
+
+    env = dict(host)
+    env.update({
+        "FLATPAK_ID": info["id"],
+        "container": "flatpak",
+        "PATH": "/app/bin:/usr/bin",
+        "XDG_DATA_DIRS": "/app/share:/usr/share:/usr/share/runtime/share",
+        "XDG_CONFIG_DIRS": "/app/etc/xdg:/etc/xdg",
+    })
+    for k, v in layer.items():                    # переменные оболочки сильнее файлов
+        env[k] = os.environ[k] if k in os.environ and not k.startswith("LD_") else v
+    lp = lib_path("/app", "/usr", arch)
+    if i386:
+        lp += ":" + I386_DIR                      # 64-битные процессы пропустят чужой класс ELF
+    if layer.get("LD_LIBRARY_PATH"):
+        lp += ":" + layer["LD_LIBRARY_PATH"]
+    env["LD_LIBRARY_PATH"] = lp
+    gi = ["/app/lib/%s/girepository-1.0" % tri, "/usr/lib/%s/girepository-1.0" % tri,
+          "/app/lib/girepository-1.0", "/usr/lib/girepository-1.0"]
+    if env.get("GI_TYPELIB_PATH"):
+        gi.append(env["GI_TYPELIB_PATH"])
+    env["GI_TYPELIB_PATH"] = ":".join(gi)
+    env.update({
+        "HOME": home, "USER": pw.pw_name, "LOGNAME": pw.pw_name,
+        "XDG_CONFIG_HOME": var + "/config",
+        "XDG_DATA_HOME": var + "/data",
+        "XDG_CACHE_HOME": var + "/cache",
+        "XDG_STATE_HOME": var + "/.local/state",
+        "XDG_RUNTIME_DIR": xr,
+    })
+    if xauth:
+        env["XAUTHORITY"] = home + "/.Xauthority"
+    return env
+
+
+def chroot_mkpoints(root, mounts):
+    """Создать точки монтирования. Если точка внутри уже смонтированного каталога
+    (например, под /usr или домом), каталог создаётся в его источнике на диске."""
+    done = []
+    for typ, src, dst, _ in mounts:
+        best = None
+        for t2, s2 in done:
+            if (dst == t2 or dst.startswith(t2.rstrip("/") + "/")) \
+                    and (best is None or len(t2) > len(best[0])):
+                best = (t2, s2)
+        if best is not None and not os.path.isabs(best[1]):
+            base = None                           # devfs/tmpfs: каталог создаёт сама ФС
+        elif best is not None:
+            base = best[1] + dst[len(best[0]):]
+        else:
+            base = root + dst
+        if base is not None and os.path.isabs(src):
+            os.makedirs(base, exist_ok=True)
+        done.append((dst, src))
+
+
+def mounted_under(rroot):
+    """Точки монтирования внутри rroot, самые глубокие первыми."""
+    try:
+        out = subprocess.run(["mount", "-p"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True).stdout
+    except OSError:
+        return []
+    pts = set()
+    for ln in out.splitlines():
+        f = ln.split()
+        if len(f) >= 2 and (f[1] == rroot or f[1].startswith(rroot + "/")):
+            pts.add(f[1].replace("\\040", " "))
+    return sorted(pts, key=len, reverse=True)
+
+
+def shq(cmd):
+    return " ".join(shlex.quote(a) for a in cmd)
+
+
+def umount_tree(root, runner, dry=False):
+    rroot = os.path.realpath(root)
+    pts = mounted_under(rroot)
+    if not pts:
+        return True
+    script = "; ".join("umount %s || umount -f %s" % (shlex.quote(p), shlex.quote(p))
+                       for p in pts)
+    if dry:
+        print("+ " + shq(runner + ["sh", "-c", script]))
+        return True
+    subprocess.run(runner + ["sh", "-c", script], stderr=subprocess.DEVNULL)
+    left = mounted_under(rroot)
+    if left:
+        warn("не удалось размонтировать: %s\n  что держит: fuser -cm %s\n"
+             "  потом: %s umount ID" % (", ".join(left), left[-1], sys.argv[0]))
+        return False
+    return True
+
+
+def live_users(pids):
+    out = []
+    try:
+        names = os.listdir(pids)
+    except OSError:
+        return out
+    for n in names:
+        if not n.isdigit() or int(n) == os.getpid():
+            continue
+        try:
+            os.kill(int(n), 0)
+            out.append(int(n))
+        except ProcessLookupError:
+            try:
+                os.unlink(os.path.join(pids, n))
+            except OSError:
+                pass
+        except PermissionError:
+            out.append(int(n))
+    return out
+
+
+def do_run_chroot(info, extra, binds=(), command=None, dry=False):
+    afiles, rfiles, rdir = paths_for(info)
+    arch = info["arch"]
+    ld = find_ld(rfiles, arch)
+    cmd_host = command_path(info, afiles)
+    if ld is None or (not command and not os.path.exists(cmd_host)):
+        die("приложение не готово. Выполните: install %s" % info["id"])
+    runner = root_runner()
+    if not dry:
+        if not sys.platform.startswith("freebsd"):
+            die("--chroot работает только на FreeBSD (для проверки есть --dry-run)")
+        if runner is None:
+            die("--chroot нужен root для mount и chroot: установите doas или sudo")
+    runner = runner or ["sudo"]
+    pw = pwd.getpwuid(os.getuid())
+    home = pw.pw_dir
+    var = os.path.expanduser("~/.var/app/%s" % info["id"])
+    root = chroot_dir(info["id"])
+    rroot = os.path.realpath(root)
+
+    install_interp(afiles, ld)         # у уже обёрнутых ELF PT_INTERP = /app/.ld
+    if not dry and linux_loaded() is False:
+        warn("Linuxulator не загружен (service linux start)")
+    i386 = ensure_i386(info, patch_base=False) if wants_i386(info, afiles) else None
+
+    os.makedirs(root, exist_ok=True)
+    os.makedirs(var, exist_ok=True)
+    build_chroot_tree(info, root, rfiles, home, pw, var)
+    ensure_flatpak_info(info, "/app", "/usr",
+                        [(I386_EXT, i386[1])] if i386 else [], quiet=True,
+                        base=root, var="%s/.var/app/%s" % (home, info["id"]))
+    xauth = copy_xauthority(var)
+    if not os.environ.get("DISPLAY"):
+        warn("DISPLAY не задан")
+    xr = os.environ.get("XDG_RUNTIME_DIR")
+    if not xr:
+        xr = "/tmp/xdg-runtime-%d" % os.getuid()
+        os.makedirs(xr, mode=0o700, exist_ok=True)
+
+    mounts = [("nullfs", rfiles, "/usr", "ro"),
+              ("nullfs", afiles, "/app", "ro")]
+    if i386:
+        os.makedirs(os.path.join(rfiles, "lib", "i386-linux-gnu"), exist_ok=True)
+        mounts.append(("nullfs", i386[0], I386_DIR, "ro"))
+    mounts += [("devfs", "devfs", "/dev", None),
+               ("fdescfs", "fdescfs", "/dev/fd", "linrdlnk"),
+               ("tmpfs", "tmpfs", "/dev/shm", "mode=1777"),
+               ("linprocfs", "linprocfs", "/proc", None),
+               ("linsysfs", "linsysfs", "/sys", None),
+               ("nullfs", "/tmp", "/tmp", None),
+               ("nullfs", var, home, None)]
+    if not xr.startswith("/tmp/") and os.path.isdir(xr):
+        mounts.append(("nullfs", xr, xr, None))
+    if os.path.isdir("/var/run/dbus"):
+        mounts.append(("nullfs", "/var/run/dbus", "/run/dbus", None))
+    for b in binds:
+        src, _, dst = b.partition(":")
+        src = os.path.abspath(os.path.expanduser(src))
+        if not os.path.isdir(src):
+            die("--bind: %s не каталог" % src)
+        mounts.append(("nullfs", src, os.path.abspath(dst or src), None))
+    chroot_mkpoints(root, mounts)
+
+    env = chroot_env(info, afiles, rfiles, rdir, i386, home, pw, xr, xauth)
+    start_dbus(env)
+    if command:
+        inner = command
+    else:
+        c = info.get("command") or info["id"]
+        inner = c if c.startswith("/") else "/app/bin/" + c
+    argv = runner + ["env", "-i"] + ["%s=%s" % kv for kv in sorted(env.items())] \
+        + ["chroot", "-u", pw.pw_name, rroot, inner] + list(extra)
+
+    def mount_cmd(m):
+        typ, src, dst, opts = m
+        return ["mount", "-t", typ] + (["-o", opts] if opts else []) + [src, rroot + dst]
+
+    already = set(mounted_under(rroot))
+    todo = [mount_cmd(m) for m, dst in ((m, rroot + m[2]) for m in mounts)
+            if dst not in already]
+    mount_script = " && ".join(shq(c) for c in todo)
+
+    if dry:
+        print("# корень: %s" % rroot)
+        if todo:
+            print("+ " + shq(runner + ["sh", "-c", mount_script]))
+        print("+ " + shq(argv))
+        print("# после выхода (если других экземпляров нет):")
+        for p in sorted((rroot + m[2] for m in mounts), key=len, reverse=True):
+            print("+ " + shq(runner + ["umount", p]))
+        return
+
+    pids = root + ".pids"
+    os.makedirs(pids, exist_ok=True)
+    mine = os.path.join(pids, str(os.getpid()))
+    open(mine, "w").close()
+    rc = 1
+    try:
+        if todo:
+            for m in CHROOT_MODS:
+                if subprocess.run(["kldstat", "-q", "-m", m]).returncode != 0:
+                    subprocess.run(runner + ["kldload", m], stderr=subprocess.DEVNULL)
+            if subprocess.run(runner + ["sh", "-c", mount_script]).returncode != 0:
+                die("не удалось смонтировать корень %s (см. сообщения выше)" % rroot)
+        proc = subprocess.Popen(argv)
+        while True:
+            try:
+                rc = proc.wait()
+                break
+            except KeyboardInterrupt:      # SIGINT получил и дочерний процесс
+                continue
+    finally:
+        try:
+            os.unlink(mine)
+        except OSError:
+            pass
+        if not live_users(pids):
+            umount_tree(root, runner)
+    sys.exit(rc if rc >= 0 else 128 - rc)
+
+
+def cmd_umount(a):
+    root = chroot_dir(a.target)
+    pids = root + ".pids"
+    users = live_users(pids)
+    if users and not a.force:
+        die("chroot используют процессы %s; --force размонтирует всё равно"
+            % ", ".join(map(str, users)))
+    runner = root_runner()
+    if runner is None:
+        die("нужен root: установите doas или sudo")
+    if not umount_tree(root, runner):
+        sys.exit(1)
+    print("размонтировано: %s" % os.path.realpath(root))
 
 
 # ------------------------------------------------------------------ поиск
@@ -1666,19 +2101,27 @@ def main():
         p.add_argument("--arch")
         p.add_argument("--force", action="store_true")
 
+    def add_chroot_opts(p):
+        p.add_argument("--chroot", action="store_true",
+                       help="запуск в корне, собранном как во Flatpak (нужен root: doas/sudo)")
+        p.add_argument("--dry-run", action="store_true",
+                       help="с --chroot: собрать корень и показать команды, ничего не монтируя")
+        p.add_argument("--bind", action="append", default=[], metavar="SRC[:DST]",
+                       help="с --chroot: примонтировать каталог (можно несколько раз)")
+        p.add_argument("--command", help="с --chroot: запустить это вместо команды приложения "
+                                         "(например, --command bash)")
+
     for name in ("install", "start"):
         add_install_opts(sub.add_parser(name))
+    add_chroot_opts(sub.choices["start"])
     sub.choices["start"].add_argument("--isolate", action="store_true",
                                       help="данные приложения в ~/.var/app/ID, как во Flatpak")
-    sub.choices["start"].add_argument("--chroot", action="store_true",
-                                      help="запустить в chroot (/compat/linux)")
     sub.choices["start"].add_argument("rest", nargs=argparse.REMAINDER)
     p = sub.add_parser("run")
     p.add_argument("target")
     p.add_argument("--branch")
     p.add_argument("--isolate", action="store_true")
-    p.add_argument("--chroot", action="store_true",
-                   help="запустить в chroot (/compat/linux)")
+    add_chroot_opts(p)
     p.add_argument("rest", nargs=argparse.REMAINDER)
     p = sub.add_parser("update")
     p.add_argument("target", nargs="?")
@@ -1703,6 +2146,9 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("target")
         p.add_argument("--branch")
+    p = sub.add_parser("umount")
+    p.add_argument("target")
+    p.add_argument("--force", action="store_true")
     p = sub.add_parser("remove")
     p.add_argument("target")
     p.add_argument("--branch")
@@ -1711,16 +2157,15 @@ def main():
     a = ap.parse_args()
     ROOT = os.path.abspath(a.root)
     os.makedirs(ROOT, exist_ok=True)
-    rest = list(getattr(a, "rest", []))
-    if a.cmd in ("run", "start"):
-        # REMAINDER забирает всё после ID, поэтому наши флаги, стоящие до "--", достаём сами
-        cut = rest.index("--") if "--" in rest else len(rest)
-        for flag in ("--chroot", "--isolate"):
-            while flag in rest[:cut]:
-                rest.pop(rest.index(flag))
-                cut -= 1
-                setattr(a, flag[2:], True)
-    extra = [x for x in rest if x != "--"]
+    extra = [x for x in getattr(a, "rest", []) if x != "--"]
+    if a.cmd in ("run", "start") and not a.chroot and (a.bind or a.command or a.dry_run):
+        die("--bind, --command и --dry-run работают только вместе с --chroot")
+
+    def launch(info):
+        if a.chroot:
+            do_run_chroot(info, extra, a.bind, a.command, a.dry_run)
+        else:
+            do_run(info, extra, a.isolate)
 
     if a.cmd == "install":
         info = do_install(make_target(a), a.jobs, a.force)
@@ -1735,9 +2180,11 @@ def main():
         except SystemExit:
             print("не установлено, ставлю (может занять время)")
             info = do_install(t, a.jobs, a.force)
-        do_run(info, extra, a.isolate, a.chroot)
+        launch(info)
     elif a.cmd == "run":
-        do_run(load_info(a.target, a.branch), extra, a.isolate, a.chroot)
+        launch(load_info(a.target, a.branch))
+    elif a.cmd == "umount":
+        cmd_umount(a)
     elif a.cmd == "update":
         cmd_update(a)
     elif a.cmd == "search":
