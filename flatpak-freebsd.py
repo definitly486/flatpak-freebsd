@@ -755,6 +755,60 @@ def ensure_link(afiles, quiet=False):
     return True
 
 
+def host_timezone():
+    """Имя часового пояса хоста (Area/City) или None."""
+    tz = os.environ.get("TZ", "").lstrip(":")
+    if re.fullmatch(r"[A-Za-z_+\-0-9]+(/[A-Za-z_+\-0-9]+)+", tz or ""):
+        return tz
+    try:                                   # FreeBSD: tzsetup пишет имя сюда
+        with open("/var/db/zoneinfo") as f:
+            tz = f.read().strip()
+        if tz:
+            return tz
+    except OSError:
+        pass
+    try:                                   # на случай, если /etc/localtime - симлинк
+        tz = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in tz:
+            return tz.split("/zoneinfo/", 1)[1]
+    except OSError:
+        pass
+    return None
+
+
+def ensure_timezone(quiet=False):
+    """Создаёт /compat/linux/etc/timezone (нужен libecal/GNOME Calendar)."""
+    if not os.path.isdir("/compat/linux/etc"):
+        return
+    target = "/compat/linux/etc/timezone"
+    if os.path.exists(target):
+        return
+    tz = host_timezone()
+    if not tz:
+        if not quiet:
+            print("предупреждение: не удалось определить часовой пояс; "
+                  "создайте %s вручную (например: Europe/Helsinki)" % target,
+                  file=sys.stderr)
+        return
+    if os.geteuid() == 0:
+        runner = []
+    else:
+        runner = [r for r in ("doas", "sudo") if shutil.which(r)][:1]
+        if not runner:
+            if not quiet:
+                print("предупреждение: нет doas/sudo, не могу создать %s" % target,
+                      file=sys.stderr)
+            return
+    try:
+        subprocess.run(runner + ["tee", target], input=tz + "\n", text=True,
+                       stdout=subprocess.DEVNULL, check=True)
+        if not quiet:
+            print("создан %s (%s)" % (target, tz))
+    except (subprocess.CalledProcessError, OSError) as e:
+        if not quiet:
+            print("не удалось создать %s: %s" % (target, e), file=sys.stderr)
+
+
 # ------------------------------------------------------------ запуск
 def linux_loaded():
     try:
@@ -834,6 +888,7 @@ def do_run(info, extra, isolate=False):
     if not link_ok(afiles) and not ensure_link(afiles):
         die("ссылка %s должна указывать на %s: через неё ядро находит загрузчик рантайма"
             % (link_path(), afiles))
+    ensure_timezone()
 
     merged = dict(ENV_DEFAULTS)
     merged.update(read_env_file(P("env")))
