@@ -1271,6 +1271,21 @@ def _write(path, data, mode=0o644):
     os.chmod(path, mode)
 
 
+def _mkpoint(path):
+    """Каталог-точка монтирования. Битую или абсолютную симлинку (в рантайме такие
+    бывают на месте точек расширений) заменяет каталогом; обычный файл - ошибка."""
+    if os.path.islink(path):
+        if os.path.isabs(os.readlink(path)) or not os.path.isdir(path):
+            os.unlink(path)
+        else:
+            return
+    if os.path.isdir(path):
+        return
+    if os.path.lexists(path):
+        die("%s - не каталог, смонтировать сюда нельзя" % path)
+    os.makedirs(path, exist_ok=True)
+
+
 def meta_env(path):
     """Секция [Environment] файла metadata: Flatpak передаёт её приложению как есть."""
     return parse_ini(read_text(path) or "").get("Environment", {})
@@ -1445,7 +1460,7 @@ def chroot_mkpoints(root, mounts):
         else:
             base = root + dst
         if base is not None and os.path.isabs(src):
-            os.makedirs(base, exist_ok=True)
+            _mkpoint(base)
         done.append((dst, src))
 
 
@@ -1551,7 +1566,7 @@ def do_run_chroot(info, extra, binds=(), command=None, dry=False):
     mounts = [("nullfs", rfiles, "/usr", "ro"),
               ("nullfs", afiles, "/app", "ro")]
     if i386:
-        os.makedirs(os.path.join(rfiles, "lib", "i386-linux-gnu"), exist_ok=True)
+        _mkpoint(os.path.join(rfiles, "lib", "i386-linux-gnu"))
         mounts.append(("nullfs", i386[0], I386_DIR, "ro"))
     mounts += [("devfs", "devfs", "/dev", None),
                ("fdescfs", "fdescfs", "/dev/fd", "linrdlnk"),
